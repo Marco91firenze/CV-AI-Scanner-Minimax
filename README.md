@@ -1,6 +1,6 @@
 # AI CV Scanner
 
-GDPR-compliant B2B SaaS for uploading CVs and ranking candidates against job requirements using Azure OpenAI. Frontend: Next.js 14 on Vercel. Backend: FastAPI on Railway/Render.
+GDPR-oriented B2B SaaS for uploading CVs and ranking candidates against job requirements using the **OpenAI API**. Frontend: Next.js 14 on Vercel. Backend: FastAPI on Railway/Render. Data: **MongoDB Atlas** + **S3-compatible storage** (no Azure required).
 
 ## Project location
 
@@ -9,7 +9,7 @@ The scaffold is created under **`ai-cv-scanner/`** in this workspace. To match `
 ## Structure
 
 - `frontend/` — Next.js App Router, TypeScript, Tailwind
-- `backend/` — FastAPI, Cosmos DB, Blob Storage, Stripe, JWT auth
+- `backend/` — FastAPI, MongoDB, S3-compatible object storage, OpenAI API, Stripe, JWT auth
 
 ## Quick start (local)
 
@@ -21,7 +21,7 @@ python -m venv .venv
 .venv\Scripts\activate   # Windows
 pip install -r requirements.txt
 copy .env.example .env
-# Fill .env with Azure, Stripe, JWT secret
+# Fill .env with MongoDB, S3/R2, OpenAI, Stripe, JWT secret
 uvicorn main:app --reload --port 8000
 ```
 

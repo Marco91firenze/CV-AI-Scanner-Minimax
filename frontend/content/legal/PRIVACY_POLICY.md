@@ -40,7 +40,7 @@ For AI CV Scanner’s own operational processing (such as security logs), AI CV 
 
 ## 6. SUB-PROCESSORS
 
-We use **Microsoft Azure** services (including **Azure OpenAI** and **Cosmos DB**) and **Stripe** for payments. CV content is not sent to Stripe.
+We use **OpenAI** (API) for CV analysis, **S3-compatible object storage** (for example **AWS S3** or **Cloudflare R2**) for encrypted CV file blobs, **MongoDB Atlas** for application metadata, and **Stripe** for payments. CV content is not sent to Stripe.
 
 ---
 
@@ -66,7 +66,7 @@ We implement **encryption**, **access controls**, and **tenant isolation** (incl
 
 ## 10. INTERNATIONAL TRANSFERS
 
-The Service is designed for **EU data residency** when Customers configure Azure resources in the EU. Customers are responsible for their cloud configuration consistent with their transfer requirements.
+The Service supports **EU-oriented deployment** when Customers configure MongoDB Atlas, object storage, and OpenAI-related settings consistent with their transfer and residency requirements. Customers are responsible for their cloud and vendor configuration.
 
 ---
 

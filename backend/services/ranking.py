@@ -1,4 +1,4 @@
-"""Azure OpenAI ranking for CV vs job requirements."""
+"""OpenAI API ranking for CV vs job requirements (no Azure required)."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import json
 import re
 from typing import Any
 
-from openai import AzureOpenAI
+from openai import OpenAI
 
 
 SYSTEM_PROMPT = (
@@ -20,23 +20,17 @@ def rank_cv(
     cv_text: str,
     job_title: str,
     job_requirements: str,
-    endpoint: str,
     api_key: str,
-    api_version: str,
-    deployment: str,
+    model: str,
 ) -> dict[str, Any]:
-    client = AzureOpenAI(
-        azure_endpoint=endpoint.rstrip("/") + "/",
-        api_key=api_key,
-        api_version=api_version,
-    )
+    client = OpenAI(api_key=api_key)
     user_content = (
         f"Job title: {job_title}\n\n"
         f"Job requirements:\n{job_requirements}\n\n"
         f"CV text:\n{cv_text}\n"
     )
     completion = client.chat.completions.create(
-        model=deployment,
+        model=model,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_content},
@@ -50,7 +44,6 @@ def rank_cv(
 
 def _parse_response(raw: str) -> dict[str, Any]:
     raw = raw.strip()
-    # Strip markdown code fences if present
     if raw.startswith("```"):
         raw = re.sub(r"^```(?:json)?\s*", "", raw)
         raw = re.sub(r"\s*```$", "", raw)

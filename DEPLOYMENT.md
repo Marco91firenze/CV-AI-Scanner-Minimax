@@ -1,93 +1,54 @@
 # Deployment Guide — AI CV Scanner
 
-This guide covers Azure (Cosmos DB, Blob Storage, Azure OpenAI), Stripe, backend hosting (Railway or Render), and frontend hosting (Vercel).
+This guide covers **MongoDB Atlas**, **S3-compatible object storage** (AWS S3, Cloudflare R2, etc.), **OpenAI API**, Stripe (live), backend hosting (Railway or Render), and frontend hosting (Vercel). **No Microsoft Azure subscription is required.**
 
 ---
 
-## 1. Azure setup
+## 1. MongoDB Atlas (database)
 
-### 1.1 Resource group and region
+1. [MongoDB Atlas](https://www.mongodb.com/atlas) → **Create** a cluster (e.g. **M0** free tier) in an **EU** region (e.g. Frankfurt / Dublin).
+2. **Database Access** → create a DB user (username + password).
+3. **Network Access** → allow your backend host IPs, or **0.0.0.0/0** for quick start (tighten for production).
+4. **Database** → **Connect** → **Drivers** → copy the **connection string** (`mongodb+srv://...`).
+5. Set in backend env:
+   - `MONGODB_URI` — full URI with user/password substituted.
+   - `MONGODB_DATABASE` — e.g. `ai_cv_scanner` (collections `companies`, `jobs`, `cvs`, `transactions` are created automatically on first run with indexes).
 
-Create resources in an **EU region** (for example `westeurope`) to align with data residency commitments.
+---
 
-```bash
-az group create --name rg-ai-cv-scanner --location westeurope
-```
+## 2. Object storage (S3-compatible)
 
-### 1.2 Cosmos DB (SQL API)
+Create a **private** bucket in an **EU** region (or EU-capable provider).
 
-```bash
-az cosmosdb create \
-  --name cosmos-aicv-YOURNAME \
-  --resource-group rg-ai-cv-scanner \
-  --default-consistency-level Session \
-  --locations regionName=westeurope failoverPriority=0 isZoneRedundant=False
+**AWS S3:** create bucket (e.g. `eu-central-1`), IAM user with `s3:PutObject`, `s3:GetObject`, `s3:DeleteObject`, `s3:ListBucket` on that bucket. Set:
 
-az cosmosdb sql database create \
-  --account-name cosmos-aicv-YOURNAME \
-  --resource-group rg-ai-cv-scanner \
-  --name ai_cv_scanner
-```
+- `S3_BUCKET`
+- `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY`
+- `S3_REGION` (e.g. `eu-central-1`)
+- Leave `S3_ENDPOINT_URL` empty (default AWS endpoint).
 
-Create containers (partition keys must match the backend):
+**Cloudflare R2:** create bucket + API token with object read/write. Set:
 
-```bash
-# companies: partition key /id
-az cosmosdb sql container create \
-  --account-name cosmos-aicv-YOURNAME \
-  --resource-group rg-ai-cv-scanner \
-  --database-name ai_cv_scanner \
-  --name companies \
-  --partition-key-path "/id"
+- `S3_BUCKET`
+- `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY`
+- `S3_ENDPOINT_URL` = `https://<account_id>.r2.cloudflarestorage.com`
+- `S3_REGION` = `auto` (optional; defaults to `auto` when an endpoint URL is set).
 
-# jobs, cvs, transactions: partition key /company_id
-for c in jobs cvs transactions; do
-  az cosmosdb sql container create \
-    --account-name cosmos-aicv-YOURNAME \
-    --resource-group rg-ai-cv-scanner \
-    --database-name ai_cv_scanner \
-    --name "$c" \
-    --partition-key-path "/company_id"
-done
-```
+The app **encrypts file bytes before upload**; the bucket stores ciphertext only.
 
-Copy **URI** and **PRIMARY KEY** from the Azure Portal → Cosmos DB → Keys. Set:
+---
 
-- `COSMOS_ENDPOINT`
-- `COSMOS_KEY`
-- `COSMOS_DATABASE=ai_cv_scanner` (or your chosen DB name, matching `.env`)
+## 3. OpenAI API
 
-The backend also calls `create_container_if_not_exists` on startup for development convenience; production should use IaC or the CLI above.
+1. [OpenAI Platform](https://platform.openai.com/) → API keys → create a **secret key**.
+2. Ensure billing is enabled and your org allows the model you pick (default **`gpt-4o-mini`**).
+3. Set `OPENAI_API_KEY` and optionally `OPENAI_MODEL` (default `gpt-4o-mini`).
 
-### 1.3 Blob Storage
+Review OpenAI’s data processing / retention settings so they match your DPA and customer commitments.
 
-```bash
-az storage account create \
-  --name staicvYOURNAME \
-  --resource-group rg-ai-cv-scanner \
-  --location westeurope \
-  --sku Standard_LRS
+---
 
-az storage container create \
-  --account-name staicvYOURNAME \
-  --name cvs \
-  --auth-mode login
-```
-
-Create a **connection string** in the Portal (Access keys) and set `AZURE_STORAGE_CONNECTION_STRING` and `AZURE_STORAGE_CONTAINER=cvs`.
-
-### 1.4 Azure OpenAI (gpt-4o-mini)
-
-In Azure AI Foundry / Azure OpenAI, create a resource in **EU**, deploy **`gpt-4o-mini`**, then set:
-
-- `AZURE_OPENAI_ENDPOINT`
-- `AZURE_OPENAI_API_KEY`
-- `AZURE_OPENAI_API_VERSION` (for example `2024-02-15-preview` or your resource’s supported version)
-- `AZURE_OPENAI_DEPLOYMENT` (deployment name, often `gpt-4o-mini`)
-
-Confirm **content filtering** and **data processing** settings match your DPA commitments.
-
-### 1.5 Encryption key
+## 4. Encryption key
 
 Generate a 32-byte base64 key for `CV_ENCRYPTION_KEY`:
 
@@ -95,30 +56,24 @@ Generate a 32-byte base64 key for `CV_ENCRYPTION_KEY`:
 python -c "import os,base64; print(base64.b64encode(os.urandom(32)).decode())"
 ```
 
+**Back this up.** Losing it means encrypted blobs cannot be decrypted.
+
 ---
 
-## 2. Stripe setup
+## 5. Stripe setup (Live)
 
-1. Create a Stripe account (test mode for staging).
-2. **Products / Prices**
-   - Product **Starter** — one-time **€50** price → note `price_...` ID.
-   - Product **Professional** — one-time **€300** price → note `price_...` ID.
-3. Map IDs in backend `.env`:
-   - `STRIPE_PRICE_STARTER`
-   - `STRIPE_PRICE_PROFESSIONAL`
-4. **Webhook**
-   - Endpoint URL: `https://YOUR-BACKEND/api/stripe/webhook`
-   - Events: `checkout.session.completed`
-   - Copy signing secret → `STRIPE_WEBHOOK_SECRET`
-5. **Secret key** → `STRIPE_SECRET_KEY`
+1. In Stripe Dashboard, use **Live mode**.
+2. **Products / Prices** — one-time **€50** (100 credits) and **€300** (1000 credits); copy each live **`price_...`** ID into `STRIPE_PRICE_STARTER` / `STRIPE_PRICE_PROFESSIONAL`.
+3. **Developers → API keys** — copy **Secret key** `sk_live_...` → `STRIPE_SECRET_KEY`.
+4. After the backend has a public URL: **Webhooks** → add endpoint `https://YOUR-BACKEND/api/stripe/webhook`, event **`checkout.session.completed`**, copy **Signing secret** `whsec_...` → `STRIPE_WEBHOOK_SECRET`.
 
 The checkout session stores `metadata.company_id` and `metadata.credits`; the webhook credits the company on successful payment.
 
 ---
 
-## 3. Backend deployment
+## 6. Backend deployment
 
-### 3.1 Railway (recommended)
+### 6.1 Railway (recommended)
 
 1. New Project → Deploy from GitHub (or CLI).
 2. **Root directory:** `backend`
@@ -131,7 +86,7 @@ uvicorn main:app --host 0.0.0.0 --port $PORT
 4. Add **all** variables from `backend/.env.example` in the Railway Variables UI.
 5. Note the public URL (for example `https://yourapp.up.railway.app`).
 
-### 3.2 Render
+### 6.2 Render
 
 1. New **Web Service** → connect repo.
 2. **Root Directory:** `backend`
@@ -141,7 +96,7 @@ uvicorn main:app --host 0.0.0.0 --port $PORT
 
 ---
 
-## 4. Frontend deployment (Vercel + GitHub)
+## 7. Frontend deployment (Vercel + GitHub)
 
 1. Push the repository to GitHub.
 2. **Import** the repo in Vercel.
@@ -150,13 +105,11 @@ uvicorn main:app --host 0.0.0.0 --port $PORT
 5. **Environment variable:** `NEXT_PUBLIC_API_URL=https://YOUR-BACKEND-URL` (no trailing slash)
 6. Deploy.
 
-GitHub Desktop workflow: commit from Desktop → push → Vercel auto-builds on `main`.
-
 Set backend `PUBLIC_APP_URL` to your Vercel production URL so Stripe success/cancel redirects land on your site.
 
 ---
 
-## 5. Environment variables (checklist)
+## 8. Environment variables (checklist)
 
 ### Backend (`backend/.env`)
 
@@ -164,10 +117,10 @@ Set backend `PUBLIC_APP_URL` to your Vercel production URL so Stripe success/can
 |----------|---------|
 | `JWT_SECRET` | HS256 signing secret |
 | `CORS_ORIGINS` | Comma-separated allowed web origins |
-| `COSMOS_*` | Cosmos endpoint, key, DB name, container names |
-| `AZURE_STORAGE_*` | Blob connection string + container |
+| `MONGODB_URI` / `MONGODB_DATABASE` | Atlas connection string + database name |
+| `S3_*` | Bucket, keys, optional endpoint + region |
 | `CV_ENCRYPTION_KEY` | Base64 32-byte AES key |
-| `AZURE_OPENAI_*` | Endpoint, key, API version, deployment name |
+| `OPENAI_API_KEY` / `OPENAI_MODEL` | Chat Completions for ranking |
 | `STRIPE_*` | Secret key, webhook secret, price IDs |
 | `STARTER_CREDITS` / `PROFESSIONAL_CREDITS` | Must match commercial terms (100 / 1000) |
 | `PUBLIC_APP_URL` | Frontend URL for Stripe redirects |
@@ -180,13 +133,13 @@ Set backend `PUBLIC_APP_URL` to your Vercel production URL so Stripe success/can
 
 ---
 
-## 6. Post-deployment checklist
+## 9. Post-deployment checklist
 
-- [ ] Cosmos containers exist with correct **partition keys** (`/id` for companies, `/company_id` for others).
-- [ ] Blob container `cvs` exists; backend can upload a test object.
-- [ ] Azure OpenAI deployment answers a test chat completion from the server.
+- [ ] MongoDB Atlas cluster reachable from backend (network allowlist); indexes created on first boot.
+- [ ] S3/R2 bucket exists; backend can upload, read, and delete a test object.
+- [ ] OpenAI API returns a successful chat completion from the server.
 - [ ] Register → DPA accept → create job → upload PDF → score appears; blob deleted after rank.
-- [ ] Stripe test checkout completes; webhook fires; `credits` increments.
+- [ ] Stripe **live** checkout completes; webhook fires; `credits` increments.
 - [ ] `CORS_ORIGINS` includes your Vercel domain.
 - [ ] `PUBLIC_APP_URL` matches Vercel production URL.
 - [ ] HTTPS only in production; rotate `JWT_SECRET` and `CV_ENCRYPTION_KEY` if leaked.
@@ -194,6 +147,14 @@ Set backend `PUBLIC_APP_URL` to your Vercel production URL so Stripe success/can
 
 ---
 
-## 7. Monorepo note
+## 10. GitHub Actions (CI only)
+
+The repository uses **`.github/workflows/ci.yml`**: it installs backend dependencies, compiles Python files, and runs `next lint` on the frontend. It does **not** deploy anywhere. Backend and frontend are deployed via **Railway/Render** and **Vercel** as described above.
+
+If you previously connected this repo to **Azure App Service**, you can delete unused GitHub secrets such as `AZUREAPPSERVICE_CLIENTID_*`, `AZUREAPPSERVICE_TENANTID_*`, and `AZUREAPPSERVICE_SUBSCRIPTIONID_*` so nothing points at Azure anymore.
+
+---
+
+## 11. Monorepo note
 
 Legal markdown is duplicated under `backend/LEGAL` (spec) and `frontend/content/legal` (so Next.js can read it when the Vercel root is `frontend`). Keep them in sync when you edit policies.

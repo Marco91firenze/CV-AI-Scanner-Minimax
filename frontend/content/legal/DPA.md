@@ -60,18 +60,23 @@ By accepting the Agreement in the product (or by accepting the Terms of Service 
 
 The Customer authorizes AI CV Scanner to engage Sub-processors as follows:
 
-### 6.1 Microsoft Azure OpenAI Service
+### 6.1 OpenAI API
 
 - **Purpose:** advisory scoring and reasoning generation from extracted CV text and job requirements.
-- **Region:** **EU** deployments only (Customer configuration required).
-- **Terms:** Microsoft’s data protection terms/DPA apply as between Microsoft and AI CV Scanner; **no training on Customer CV Data** where configured per Microsoft enterprise AI commitments applicable to Azure OpenAI Service.
+- **Location / transfers:** processing location and subprocessors are determined by **OpenAI**’s applicable terms and the **Customer’s** OpenAI account / API configuration. The Customer shall configure processing in line with its transfer and residency requirements.
+- **Terms:** OpenAI’s data processing terms apply as between OpenAI and AI CV Scanner. The Customer should disable or restrict uses of Customer content for model training where OpenAI offers such controls.
 
-### 6.2 Azure Cosmos DB
+### 6.2 MongoDB Atlas
 
 - **Purpose:** storage of account, job, and CV **metadata** (for example, filenames, statuses, scores, reasoning text).
-- **Region:** **EU** region (Customer configuration required).
+- **Region:** **EU** cluster / region (Customer configuration required). MongoDB Atlas DPA applies as between MongoDB and AI CV Scanner.
 
-### 6.3 Stripe Payments
+### 6.3 S3-compatible object storage
+
+- **Purpose:** storage of **encrypted** CV file blobs (ciphertext only at rest in the bucket).
+- **Region:** **EU** bucket / region or EU-capable provider (Customer configuration required). The applicable cloud provider’s data protection terms apply as between that provider and AI CV Scanner.
+
+### 6.4 Stripe Payments
 
 - **Purpose:** payment processing and billing records.
 - **Data:** **no CV Data** is sent to Stripe.
@@ -86,7 +91,7 @@ AI CV Scanner implements appropriate technical and organizational measures, incl
 
 - **AES-256 encryption at rest** for CV blobs prior to storage;
 - **TLS** for data in transit;
-- **strict tenant isolation** using partition keys so queries are scoped to the Customer’s `company_id`;
+- **strict tenant isolation** so queries are scoped to the Customer’s `company_id`;
 - **audit logging** of security-relevant administrative events as applicable to the platform.
 
 ---

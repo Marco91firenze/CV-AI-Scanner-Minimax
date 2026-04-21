@@ -1,6 +1,6 @@
 """
 AI CV Scanner — FastAPI backend.
-GDPR-oriented: tenant isolation via Cosmos partition keys, ephemeral CV blobs, DPA gate.
+GDPR-oriented: tenant isolation via MongoDB queries (company_id), ephemeral CV blobs, DPA gate.
 """
 
 from __future__ import annotations
@@ -27,11 +27,14 @@ from jose import JWTError, jwt
 from passlib.context import CryptContext
 from pydantic import BaseModel, EmailStr, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from pymongo import MongoClient
+from pymongo.database import Database
+from pymongo.errors import DuplicateKeyError
 
-from lib.cosmos import ensure_containers, query_partition
+from lib.mongo import col_companies, col_cvs, col_jobs, col_transactions, connect
 from services.extraction import extract_text_from_bytes
 from services.ranking import rank_cv
-from services.storage import BlobStorageService, delete_cv
+from services.storage import ObjectStorage, delete_cv
 
 FREE_CV_LIMIT = 10
 
@@ -47,22 +50,18 @@ class Settings(BaseSettings):
     access_token_expire_minutes: int = Field(10080, alias="ACCESS_TOKEN_EXPIRE_MINUTES")
     cors_origins: str = Field("http://localhost:3000", alias="CORS_ORIGINS")
 
-    cosmos_endpoint: str = Field(..., alias="COSMOS_ENDPOINT")
-    cosmos_key: str = Field(..., alias="COSMOS_KEY")
-    cosmos_database: str = Field("ai_cv_scanner", alias="COSMOS_DATABASE")
-    cosmos_companies: str = Field("companies", alias="COSMOS_CONTAINER_COMPANIES")
-    cosmos_jobs: str = Field("jobs", alias="COSMOS_CONTAINER_JOBS")
-    cosmos_cvs: str = Field("cvs", alias="COSMOS_CONTAINER_CVS")
-    cosmos_transactions: str = Field("transactions", alias="COSMOS_CONTAINER_TRANSACTIONS")
+    mongodb_uri: str = Field(..., alias="MONGODB_URI")
+    mongodb_database: str = Field("ai_cv_scanner", alias="MONGODB_DATABASE")
 
-    azure_storage_connection_string: str = Field(..., alias="AZURE_STORAGE_CONNECTION_STRING")
-    azure_storage_container: str = Field("cvs", alias="AZURE_STORAGE_CONTAINER")
+    s3_bucket: str = Field(..., alias="S3_BUCKET")
+    s3_access_key_id: str = Field(..., alias="S3_ACCESS_KEY_ID")
+    s3_secret_access_key: str = Field(..., alias="S3_SECRET_ACCESS_KEY")
+    s3_endpoint_url: str | None = Field(None, alias="S3_ENDPOINT_URL")
+    s3_region: str | None = Field(None, alias="S3_REGION")
     cv_encryption_key: str = Field(..., alias="CV_ENCRYPTION_KEY")
 
-    azure_openai_endpoint: str = Field(..., alias="AZURE_OPENAI_ENDPOINT")
-    azure_openai_api_key: str = Field(..., alias="AZURE_OPENAI_API_KEY")
-    azure_openai_api_version: str = Field("2024-02-15-preview", alias="AZURE_OPENAI_API_VERSION")
-    azure_openai_deployment: str = Field("gpt-4o-mini", alias="AZURE_OPENAI_DEPLOYMENT")
+    openai_api_key: str = Field(..., alias="OPENAI_API_KEY")
+    openai_model: str = Field("gpt-4o-mini", alias="OPENAI_MODEL")
 
     stripe_secret_key: str = Field(..., alias="STRIPE_SECRET_KEY")
     stripe_webhook_secret: str = Field(..., alias="STRIPE_WEBHOOK_SECRET")
@@ -80,26 +79,23 @@ def get_settings() -> Settings:
 settings = get_settings()
 stripe.api_key = settings.stripe_secret_key
 
-_database = ensure_containers(
-    settings.cosmos_endpoint,
-    settings.cosmos_key,
-    settings.cosmos_database,
-    settings.cosmos_companies,
-    settings.cosmos_jobs,
-    settings.cosmos_cvs,
-    settings.cosmos_transactions,
-)
-_companies = _database.get_container_client(settings.cosmos_companies)
-_jobs_c = _database.get_container_client(settings.cosmos_jobs)
-_cvs_c = _database.get_container_client(settings.cosmos_cvs)
-_tx_c = _database.get_container_client(settings.cosmos_transactions)
+_mongo_client: MongoClient
+_db: Database
+_mongo_client, _db = connect(settings.mongodb_uri, settings.mongodb_database)
+_companies = col_companies(_db)
+_jobs = col_jobs(_db)
+_cvs = col_cvs(_db)
+_transactions = col_transactions(_db)
 
-_blob = BlobStorageService(
-    settings.azure_storage_connection_string,
-    settings.azure_storage_container,
-    settings.cv_encryption_key,
+_storage = ObjectStorage(
+    bucket=settings.s3_bucket,
+    access_key_id=settings.s3_access_key_id,
+    secret_access_key=settings.s3_secret_access_key,
+    endpoint_url=settings.s3_endpoint_url,
+    region_name=settings.s3_region,
+    encryption_key_b64=settings.cv_encryption_key,
 )
-_blob.ensure_container()
+_storage.ensure_bucket_exists()
 
 
 @asynccontextmanager
@@ -151,10 +147,10 @@ async def get_token_data(
 
 
 def load_company(company_id: str) -> dict[str, Any]:
-    try:
-        return _companies.read_item(item=company_id, partition_key=company_id)
-    except Exception:
+    doc = _companies.find_one({"id": company_id})
+    if not doc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Company not found")
+    return doc
 
 
 async def get_current_company(company_id: Annotated[str, Depends(get_token_data)]) -> dict[str, Any]:
@@ -186,7 +182,7 @@ def trial_info(company: dict[str, Any]) -> dict[str, Any]:
 
 
 def replace_company(doc: dict[str, Any]) -> None:
-    _companies.replace_item(item=doc["id"], body=doc)
+    _companies.replace_one({"id": doc["id"]}, doc)
 
 
 # --- Pydantic models ---
@@ -237,41 +233,40 @@ def process_cv_ranking(
     used_free_slot: bool,
 ) -> None:
     company = load_company(company_id)
-    try:
-        cv = _cvs_c.read_item(item=cv_id, partition_key=company_id)
-    except Exception:
+    cv = _cvs.find_one({"id": cv_id, "company_id": company_id})
+    if not cv:
         return
     blob_path = cv.get("blob_path")
     if not blob_path:
         return
     try:
-        raw = _blob.download_cv(blob_path)
+        raw = _storage.download_cv(blob_path)
         filename = cv.get("filename", "cv.pdf")
         text = extract_text_from_bytes(raw, filename)
-        job = _jobs_c.read_item(item=cv["job_id"], partition_key=company_id)
+        job = _jobs.find_one({"id": cv["job_id"], "company_id": company_id})
+        if not job:
+            raise RuntimeError("Job not found")
         result = rank_cv(
             text,
             job.get("title", ""),
             job.get("requirements", ""),
-            settings.azure_openai_endpoint,
-            settings.azure_openai_api_key,
-            settings.azure_openai_api_version,
-            settings.azure_openai_deployment,
+            settings.openai_api_key,
+            settings.openai_model,
         )
         cv["status"] = "ranked"
         cv["score"] = result["score"]
         cv["reasoning"] = result["reasoning"]
         cv["blob_path"] = None
         cv["updated_at"] = utcnow()
-        _cvs_c.replace_item(item=cv_id, body=cv)
-        delete_cv(_blob, blob_path)
+        _cvs.replace_one({"id": cv_id, "company_id": company_id}, cv)
+        delete_cv(_storage, blob_path)
     except Exception as exc:
         cv["status"] = "error"
         cv["error_message"] = str(exc)[:2000]
         cv["updated_at"] = utcnow()
-        _cvs_c.replace_item(item=cv_id, body=cv)
+        _cvs.replace_one({"id": cv_id, "company_id": company_id}, cv)
         if blob_path:
-            delete_cv(_blob, blob_path)
+            delete_cv(_storage, blob_path)
         _reverse_cv_consumption(company, used_free_slot)
 
 
@@ -281,18 +276,13 @@ def process_cv_ranking(
 @app.post("/auth/register", response_model=dict[str, Any])
 def auth_register(body: RegisterBody):
     cid = str(uuid.uuid4())
-    # Cross-partition email check: companies container is partitioned by id, so scan is needed for email uniqueness.
-    # For production, add a separate unique index container or use email as id; here we query all partitions (limited).
-    for item in _companies.query_items(
-        query="SELECT * FROM c WHERE c.email = @e",
-        parameters=[{"name": "@e", "value": body.email}],
-        enable_cross_partition_query=True,
-    ):
+    email_norm = body.email.lower().strip()
+    if _companies.find_one({"email": email_norm}):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Email already registered")
 
     doc = {
         "id": cid,
-        "email": body.email.lower().strip(),
+        "email": email_norm,
         "password_hash": hash_password(body.password),
         "company_name": body.company_name.strip(),
         "dpa_accepted": False,
@@ -301,7 +291,10 @@ def auth_register(body: RegisterBody):
         "cvs_processed": 0,
         "created_at": utcnow(),
     }
-    _companies.create_item(body=doc)
+    try:
+        _companies.insert_one(doc)
+    except DuplicateKeyError:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Email already registered")
     token = create_access_token(cid)
     return {"access_token": token, "token_type": "bearer", **trial_info(doc)}
 
@@ -309,14 +302,7 @@ def auth_register(body: RegisterBody):
 @app.post("/auth/login")
 def auth_login(form: Annotated[OAuth2PasswordRequestForm, Depends()]):
     email = form.username.lower().strip()
-    found: dict[str, Any] | None = None
-    for item in _companies.query_items(
-        query="SELECT * FROM c WHERE c.email = @e",
-        parameters=[{"name": "@e", "value": email}],
-        enable_cross_partition_query=True,
-    ):
-        found = item
-        break
+    found = _companies.find_one({"email": email})
     if not found or not verify_password(form.password, found["password_hash"]):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Incorrect email or password")
     token = create_access_token(found["id"])
@@ -421,7 +407,7 @@ async def stripe_webhook(request: Request):
                 "credits_added": credits_add,
                 "created_at": utcnow(),
             }
-            _tx_c.create_item(body=tx)
+            _transactions.insert_one(tx)
     return {"received": True}
 
 
@@ -432,12 +418,7 @@ async def stripe_webhook(request: Request):
 def list_jobs(company: Annotated[dict[str, Any], Depends(get_current_company)]):
     require_dpa(company)
     cid = company["id"]
-    items = query_partition(
-        _jobs_c,
-        cid,
-        "SELECT * FROM c WHERE c.company_id = @cid ORDER BY c.created_at DESC",
-        [{"name": "@cid", "value": cid}],
-    )
+    items = list(_jobs.find({"company_id": cid}).sort("created_at", -1))
     return [
         JobOut(
             id=i["id"],
@@ -465,7 +446,7 @@ def create_job(
         "requirements": body.requirements.strip(),
         "created_at": utcnow(),
     }
-    _jobs_c.create_item(body=doc)
+    _jobs.insert_one(doc)
     return JobOut(
         id=jid,
         company_id=cid,
@@ -482,16 +463,9 @@ def delete_job(
 ):
     require_dpa(company)
     cid = company["id"]
-    try:
-        _jobs_c.read_item(item=job_id, partition_key=cid)
-    except Exception:
+    if not _jobs.find_one({"id": job_id, "company_id": cid}):
         raise HTTPException(404, "Job not found")
-    cvs = query_partition(
-        _cvs_c,
-        cid,
-        "SELECT * FROM c WHERE c.company_id = @cid AND c.job_id = @jid",
-        [{"name": "@cid", "value": cid}, {"name": "@jid", "value": job_id}],
-    )
+    cvs = list(_cvs.find({"company_id": cid, "job_id": job_id}))
     company_fresh = load_company(cid)
     refunds = 0
     trial_reversals = 0
@@ -503,16 +477,16 @@ def delete_job(
                 refunds += 1
         bp = cv.get("blob_path")
         if bp:
-            delete_cv(_blob, bp)
-        _cvs_c.delete_item(item=cv["id"], partition_key=cid)
+            delete_cv(_storage, bp)
+        _cvs.delete_one({"id": cv["id"], "company_id": cid})
 
     company_fresh["credits"] = int(company_fresh.get("credits", 0)) + refunds
     company_fresh["cvs_processed"] = max(
         0, int(company_fresh.get("cvs_processed", 0)) - refunds - trial_reversals
     )
     replace_company(company_fresh)
-    _jobs_c.delete_item(item=job_id, partition_key=cid)
-    _blob.delete_all_for_job(cid, job_id)
+    _jobs.delete_one({"id": job_id, "company_id": cid})
+    _storage.delete_all_for_job(cid, job_id)
     return {"ok": True, "credits_refunded": refunds, "trial_slots_restored": trial_reversals}
 
 
@@ -525,9 +499,7 @@ async def upload_cv(
 ):
     require_dpa(company)
     cid = company["id"]
-    try:
-        _jobs_c.read_item(item=job_id, partition_key=cid)
-    except Exception:
+    if not _jobs.find_one({"id": job_id, "company_id": cid}):
         raise HTTPException(404, "Job not found")
 
     company_fresh = load_company(cid)
@@ -558,7 +530,7 @@ async def upload_cv(
     blob_key = f"{uuid.uuid4()}_{safe_name}"
 
     try:
-        path = _blob.upload_cv(cid, job_id, blob_key, raw)
+        path = _storage.upload_cv(cid, job_id, blob_key, raw)
     except Exception:
         _reverse_cv_consumption(load_company(cid), used_free_slot)
         raise
@@ -578,7 +550,7 @@ async def upload_cv(
         "created_at": utcnow(),
         "updated_at": utcnow(),
     }
-    _cvs_c.create_item(body=cv_doc)
+    _cvs.insert_one(cv_doc)
     background_tasks.add_task(process_cv_ranking, cid, cv_id, used_free_slot)
     return {"id": cv_id, "status": "ranking", "filename": safe_name}
 
@@ -590,16 +562,9 @@ def list_cvs(
 ):
     require_dpa(company)
     cid = company["id"]
-    try:
-        _jobs_c.read_item(item=job_id, partition_key=cid)
-    except Exception:
+    if not _jobs.find_one({"id": job_id, "company_id": cid}):
         raise HTTPException(404, "Job not found")
-    items = query_partition(
-        _cvs_c,
-        cid,
-        "SELECT * FROM c WHERE c.company_id = @cid AND c.job_id = @jid",
-        [{"name": "@cid", "value": cid}, {"name": "@jid", "value": job_id}],
-    )
+    items = list(_cvs.find({"company_id": cid, "job_id": job_id}))
 
     def sort_key(i: dict[str, Any]) -> tuple[int, str]:
         sc = i.get("score")
@@ -632,15 +597,11 @@ def list_cvs(
 @app.delete("/account")
 def delete_account(company: Annotated[dict[str, Any], Depends(get_current_company)]):
     cid = company["id"]
-    _blob.delete_all_for_company(cid)
-    for container, pk_field in (
-        (_cvs_c, "company_id"),
-        (_jobs_c, "company_id"),
-        (_tx_c, "company_id"),
-    ):
-        for item in query_partition(container, cid, "SELECT c.id FROM c WHERE c.company_id = @cid", [{"name": "@cid", "value": cid}]):
-            container.delete_item(item=item["id"], partition_key=cid)
-    _companies.delete_item(item=cid, partition_key=cid)
+    _storage.delete_all_for_company(cid)
+    _cvs.delete_many({"company_id": cid})
+    _jobs.delete_many({"company_id": cid})
+    _transactions.delete_many({"company_id": cid})
+    _companies.delete_one({"id": cid})
     return {"ok": True, "message": "Account and associated data deletion initiated."}
 
 
@@ -649,7 +610,6 @@ def health():
     return {"status": "ok"}
 
 
-# OAuth2 token endpoint expects form; add JSON login alias for frontend convenience
 class LoginJson(BaseModel):
     email: EmailStr
     password: str
@@ -658,14 +618,7 @@ class LoginJson(BaseModel):
 @app.post("/auth/login/json")
 def auth_login_json(body: LoginJson):
     email = body.email.lower().strip()
-    found: dict[str, Any] | None = None
-    for item in _companies.query_items(
-        query="SELECT * FROM c WHERE c.email = @e",
-        parameters=[{"name": "@e", "value": email}],
-        enable_cross_partition_query=True,
-    ):
-        found = item
-        break
+    found = _companies.find_one({"email": email})
     if not found or not verify_password(body.password, found["password_hash"]):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Incorrect email or password")
     token = create_access_token(found["id"])

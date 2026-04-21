@@ -41,11 +41,11 @@ export default function HomePage() {
           {[
             {
               title: "Tenant isolation",
-              body: "Cosmos DB partition keys enforce company boundaries. Queries always include your company_id.",
+              body: "MongoDB stores tenant data with strict company_id scoping on every query.",
             },
             {
               title: "Ephemeral CV storage",
-              body: "Raw files are encrypted in Azure Blob, then deleted after ranking. Metadata powers your dashboard.",
+              body: "Raw files are encrypted and stored in your bucket, then deleted after ranking. Metadata powers your dashboard.",
             },
             {
               title: "No automated exclusion",
@@ -66,7 +66,7 @@ export default function HomePage() {
           <ul className="mt-6 list-disc space-y-2 pl-6 text-slate-600">
             <li>DPA acceptance is required before any CV upload.</li>
             <li>One-click deletion removes a job&apos;s CVs and blobs; account deletion erases tenant data.</li>
-            <li>Azure OpenAI in the EU; Stripe handles payments only — no CV content.</li>
+            <li>OpenAI API for ranking; Stripe handles payments only — no CV content to Stripe.</li>
           </ul>
           <Link href="/dpa" className="mt-6 inline-block font-semibold text-brand-700 hover:underline">
             Read the Data Processing Agreement →

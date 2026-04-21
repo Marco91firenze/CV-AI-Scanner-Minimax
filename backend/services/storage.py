@@ -1,68 +1,83 @@
-"""Azure Blob Storage for encrypted CV blobs (ephemeral)."""
+"""S3-compatible object storage (AWS S3, Cloudflare R2, etc.) for encrypted CV blobs."""
 
 from __future__ import annotations
 
-from azure.core.exceptions import ResourceNotFoundError
-from azure.storage.blob import BlobServiceClient
+import boto3
+from botocore.exceptions import ClientError
 
 from lib.encryption import decrypt_bytes, encrypt_bytes
 
 
-class BlobStorageService:
+class ObjectStorage:
+    """Encrypt-then-upload to a single bucket; paths stay compatible with prior blob layout."""
+
     def __init__(
         self,
-        connection_string: str,
-        container_name: str,
+        bucket: str,
+        access_key_id: str,
+        secret_access_key: str,
+        endpoint_url: str | None,
+        region_name: str | None,
         encryption_key_b64: str,
     ) -> None:
-        self._service = BlobServiceClient.from_connection_string(connection_string)
-        self._container_name = container_name
+        eff_region = region_name or ("auto" if endpoint_url else "eu-central-1")
+        kw: dict = {
+            "aws_access_key_id": access_key_id,
+            "aws_secret_access_key": secret_access_key,
+            "region_name": eff_region,
+        }
+        if endpoint_url:
+            kw["endpoint_url"] = endpoint_url.rstrip("/")
+        self._client = boto3.client("s3", **kw)
+        self._bucket = bucket
         self._enc_key = encryption_key_b64
-        self._container = self._service.get_container_client(container_name)
 
-    def ensure_container(self) -> None:
+    def ensure_bucket_exists(self) -> None:
         try:
-            self._container.create_container()
-        except Exception:
+            self._client.head_bucket(Bucket=self._bucket)
+        except ClientError:
             pass
 
     def upload_cv(
         self,
         company_id: str,
         job_id: str,
-        blob_name: str,
+        object_name: str,
         file_bytes: bytes,
     ) -> str:
-        """Encrypt and upload; return blob path key."""
-        path = f"tenants/{company_id}/jobs/{job_id}/{blob_name}"
+        key = f"tenants/{company_id}/jobs/{job_id}/{object_name}"
         encrypted = encrypt_bytes(file_bytes, self._enc_key)
-        blob = self._service.get_blob_client(self._container_name, path)
-        blob.upload_blob(encrypted, overwrite=True)
-        return path
+        self._client.put_object(Bucket=self._bucket, Key=key, Body=encrypted)
+        return key
 
-    def download_cv(self, blob_path: str) -> bytes:
-        blob = self._service.get_blob_client(self._container_name, blob_path)
-        data = blob.download_blob().readall()
+    def download_cv(self, key: str) -> bytes:
+        resp = self._client.get_object(Bucket=self._bucket, Key=key)
+        data = resp["Body"].read()
         return decrypt_bytes(data, self._enc_key)
 
-    def delete_blob(self, blob_path: str) -> None:
-        blob = self._service.get_blob_client(self._container_name, blob_path)
+    def delete_object(self, key: str) -> None:
         try:
-            blob.delete_blob()
-        except ResourceNotFoundError:
+            self._client.delete_object(Bucket=self._bucket, Key=key)
+        except ClientError:
             pass
 
     def delete_all_for_job(self, company_id: str, job_id: str) -> None:
         prefix = f"tenants/{company_id}/jobs/{job_id}/"
-        for b in self._container.list_blobs(name_starts_with=prefix):
-            self.delete_blob(b.name)
+        self._delete_prefix(prefix)
 
     def delete_all_for_company(self, company_id: str) -> None:
         prefix = f"tenants/{company_id}/"
-        for b in self._container.list_blobs(name_starts_with=prefix):
-            self.delete_blob(b.name)
+        self._delete_prefix(prefix)
+
+    def _delete_prefix(self, prefix: str) -> None:
+        paginator = self._client.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=self._bucket, Prefix=prefix):
+            for obj in page.get("Contents", []) or []:
+                k = obj.get("Key")
+                if k:
+                    self.delete_object(k)
 
 
-def delete_cv(storage: BlobStorageService, blob_path: str | None) -> None:
-    if blob_path:
-        storage.delete_blob(blob_path)
+def delete_cv(storage: ObjectStorage, key: str | None) -> None:
+    if key:
+        storage.delete_object(key)
