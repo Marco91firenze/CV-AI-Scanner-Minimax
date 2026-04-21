@@ -1,0 +1,672 @@
+"""
+AI CV Scanner — FastAPI backend.
+GDPR-oriented: tenant isolation via Cosmos partition keys, ephemeral CV blobs, DPA gate.
+"""
+
+from __future__ import annotations
+
+import uuid
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
+from typing import Annotated, Any
+
+import stripe
+from fastapi import (
+    BackgroundTasks,
+    Depends,
+    FastAPI,
+    File,
+    HTTPException,
+    Request,
+    UploadFile,
+    status,
+)
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+from pydantic import BaseModel, EmailStr, Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from lib.cosmos import ensure_containers, query_partition
+from services.extraction import extract_text_from_bytes
+from services.ranking import rank_cv
+from services.storage import BlobStorageService, delete_cv
+
+FREE_CV_LIMIT = 10
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    jwt_secret: str = Field(..., alias="JWT_SECRET")
+    jwt_algorithm: str = Field("HS256", alias="JWT_ALGORITHM")
+    access_token_expire_minutes: int = Field(10080, alias="ACCESS_TOKEN_EXPIRE_MINUTES")
+    cors_origins: str = Field("http://localhost:3000", alias="CORS_ORIGINS")
+
+    cosmos_endpoint: str = Field(..., alias="COSMOS_ENDPOINT")
+    cosmos_key: str = Field(..., alias="COSMOS_KEY")
+    cosmos_database: str = Field("ai_cv_scanner", alias="COSMOS_DATABASE")
+    cosmos_companies: str = Field("companies", alias="COSMOS_CONTAINER_COMPANIES")
+    cosmos_jobs: str = Field("jobs", alias="COSMOS_CONTAINER_JOBS")
+    cosmos_cvs: str = Field("cvs", alias="COSMOS_CONTAINER_CVS")
+    cosmos_transactions: str = Field("transactions", alias="COSMOS_CONTAINER_TRANSACTIONS")
+
+    azure_storage_connection_string: str = Field(..., alias="AZURE_STORAGE_CONNECTION_STRING")
+    azure_storage_container: str = Field("cvs", alias="AZURE_STORAGE_CONTAINER")
+    cv_encryption_key: str = Field(..., alias="CV_ENCRYPTION_KEY")
+
+    azure_openai_endpoint: str = Field(..., alias="AZURE_OPENAI_ENDPOINT")
+    azure_openai_api_key: str = Field(..., alias="AZURE_OPENAI_API_KEY")
+    azure_openai_api_version: str = Field("2024-02-15-preview", alias="AZURE_OPENAI_API_VERSION")
+    azure_openai_deployment: str = Field("gpt-4o-mini", alias="AZURE_OPENAI_DEPLOYMENT")
+
+    stripe_secret_key: str = Field(..., alias="STRIPE_SECRET_KEY")
+    stripe_webhook_secret: str = Field(..., alias="STRIPE_WEBHOOK_SECRET")
+    stripe_price_starter: str = Field(..., alias="STRIPE_PRICE_STARTER")
+    stripe_price_professional: str = Field(..., alias="STRIPE_PRICE_PROFESSIONAL")
+    starter_credits: int = Field(100, alias="STARTER_CREDITS")
+    professional_credits: int = Field(1000, alias="PROFESSIONAL_CREDITS")
+    public_app_url: str = Field("http://localhost:3000", alias="PUBLIC_APP_URL")
+
+
+def get_settings() -> Settings:
+    return Settings()
+
+
+settings = get_settings()
+stripe.api_key = settings.stripe_secret_key
+
+_database = ensure_containers(
+    settings.cosmos_endpoint,
+    settings.cosmos_key,
+    settings.cosmos_database,
+    settings.cosmos_companies,
+    settings.cosmos_jobs,
+    settings.cosmos_cvs,
+    settings.cosmos_transactions,
+)
+_companies = _database.get_container_client(settings.cosmos_companies)
+_jobs_c = _database.get_container_client(settings.cosmos_jobs)
+_cvs_c = _database.get_container_client(settings.cosmos_cvs)
+_tx_c = _database.get_container_client(settings.cosmos_transactions)
+
+_blob = BlobStorageService(
+    settings.azure_storage_connection_string,
+    settings.azure_storage_container,
+    settings.cv_encryption_key,
+)
+_blob.ensure_container()
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    yield
+
+
+app = FastAPI(title="AI CV Scanner API", lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[o.strip() for o in settings.cors_origins.split(",") if o.strip()],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+def utcnow() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def verify_password(plain: str, hashed: str) -> bool:
+    return pwd_context.verify(plain, hashed)
+
+
+def hash_password(password: str) -> str:
+    return pwd_context.hash(password)
+
+
+def create_access_token(sub: str, expires_delta: timedelta | None = None) -> str:
+    expire = datetime.now(timezone.utc) + (
+        expires_delta or timedelta(minutes=settings.access_token_expire_minutes)
+    )
+    to_encode = {"sub": sub, "exp": expire}
+    return jwt.encode(to_encode, settings.jwt_secret, algorithm=settings.jwt_algorithm)
+
+
+async def get_token_data(
+    token: Annotated[str, Depends(oauth2_scheme)],
+) -> str:
+    try:
+        payload = jwt.decode(token, settings.jwt_secret, algorithms=[settings.jwt_algorithm])
+        sub: str | None = payload.get("sub")
+        if sub is None:
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid token")
+        return sub
+    except JWTError:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid token")
+
+
+def load_company(company_id: str) -> dict[str, Any]:
+    try:
+        return _companies.read_item(item=company_id, partition_key=company_id)
+    except Exception:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Company not found")
+
+
+async def get_current_company(company_id: Annotated[str, Depends(get_token_data)]) -> dict[str, Any]:
+    return load_company(company_id)
+
+
+def require_dpa(company: dict[str, Any]) -> None:
+    if not company.get("dpa_accepted"):
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Data Processing Agreement must be accepted before using this feature.",
+        )
+
+
+def trial_info(company: dict[str, Any]) -> dict[str, Any]:
+    processed = int(company.get("cvs_processed", 0))
+    free_used = min(processed, FREE_CV_LIMIT)
+    free_remaining = max(0, FREE_CV_LIMIT - processed)
+    is_trial_active = processed < FREE_CV_LIMIT
+    return {
+        "credits": int(company.get("credits", 0)),
+        "free_cvs_remaining": free_remaining,
+        "free_cvs_used": free_used,
+        "free_cvs_total": FREE_CV_LIMIT,
+        "is_trial_active": is_trial_active,
+        "cvs_processed": processed,
+        "dpa_accepted": bool(company.get("dpa_accepted")),
+    }
+
+
+def replace_company(doc: dict[str, Any]) -> None:
+    _companies.replace_item(item=doc["id"], body=doc)
+
+
+# --- Pydantic models ---
+
+
+class RegisterBody(BaseModel):
+    email: EmailStr
+    password: str = Field(min_length=8)
+    company_name: str = Field(min_length=2, max_length=200)
+
+
+class CompanyPublic(BaseModel):
+    id: str
+    email: EmailStr
+    company_name: str
+    dpa_accepted: bool
+    credits: int
+    cvs_processed: int
+
+
+class JobCreate(BaseModel):
+    title: str = Field(min_length=1, max_length=300)
+    requirements: str = Field(min_length=1, max_length=50_000)
+
+
+class JobOut(BaseModel):
+    id: str
+    company_id: str
+    title: str
+    requirements: str
+    created_at: str
+
+
+class CreditPurchaseBody(BaseModel):
+    plan: str = Field(pattern="^(starter|professional)$")
+
+
+def _reverse_cv_consumption(company: dict[str, Any], used_free_slot: bool) -> None:
+    company["cvs_processed"] = max(0, int(company.get("cvs_processed", 0)) - 1)
+    if not used_free_slot:
+        company["credits"] = int(company.get("credits", 0)) + 1
+    replace_company(company)
+
+
+def process_cv_ranking(
+    company_id: str,
+    cv_id: str,
+    used_free_slot: bool,
+) -> None:
+    company = load_company(company_id)
+    try:
+        cv = _cvs_c.read_item(item=cv_id, partition_key=company_id)
+    except Exception:
+        return
+    blob_path = cv.get("blob_path")
+    if not blob_path:
+        return
+    try:
+        raw = _blob.download_cv(blob_path)
+        filename = cv.get("filename", "cv.pdf")
+        text = extract_text_from_bytes(raw, filename)
+        job = _jobs_c.read_item(item=cv["job_id"], partition_key=company_id)
+        result = rank_cv(
+            text,
+            job.get("title", ""),
+            job.get("requirements", ""),
+            settings.azure_openai_endpoint,
+            settings.azure_openai_api_key,
+            settings.azure_openai_api_version,
+            settings.azure_openai_deployment,
+        )
+        cv["status"] = "ranked"
+        cv["score"] = result["score"]
+        cv["reasoning"] = result["reasoning"]
+        cv["blob_path"] = None
+        cv["updated_at"] = utcnow()
+        _cvs_c.replace_item(item=cv_id, body=cv)
+        delete_cv(_blob, blob_path)
+    except Exception as exc:
+        cv["status"] = "error"
+        cv["error_message"] = str(exc)[:2000]
+        cv["updated_at"] = utcnow()
+        _cvs_c.replace_item(item=cv_id, body=cv)
+        if blob_path:
+            delete_cv(_blob, blob_path)
+        _reverse_cv_consumption(company, used_free_slot)
+
+
+# --- Auth ---
+
+
+@app.post("/auth/register", response_model=dict[str, Any])
+def auth_register(body: RegisterBody):
+    cid = str(uuid.uuid4())
+    # Cross-partition email check: companies container is partitioned by id, so scan is needed for email uniqueness.
+    # For production, add a separate unique index container or use email as id; here we query all partitions (limited).
+    for item in _companies.query_items(
+        query="SELECT * FROM c WHERE c.email = @e",
+        parameters=[{"name": "@e", "value": body.email}],
+        enable_cross_partition_query=True,
+    ):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Email already registered")
+
+    doc = {
+        "id": cid,
+        "email": body.email.lower().strip(),
+        "password_hash": hash_password(body.password),
+        "company_name": body.company_name.strip(),
+        "dpa_accepted": False,
+        "dpa_accepted_at": None,
+        "credits": 0,
+        "cvs_processed": 0,
+        "created_at": utcnow(),
+    }
+    _companies.create_item(body=doc)
+    token = create_access_token(cid)
+    return {"access_token": token, "token_type": "bearer", **trial_info(doc)}
+
+
+@app.post("/auth/login")
+def auth_login(form: Annotated[OAuth2PasswordRequestForm, Depends()]):
+    email = form.username.lower().strip()
+    found: dict[str, Any] | None = None
+    for item in _companies.query_items(
+        query="SELECT * FROM c WHERE c.email = @e",
+        parameters=[{"name": "@e", "value": email}],
+        enable_cross_partition_query=True,
+    ):
+        found = item
+        break
+    if not found or not verify_password(form.password, found["password_hash"]):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Incorrect email or password")
+    token = create_access_token(found["id"])
+    return {"access_token": token, "token_type": "bearer", **trial_info(found)}
+
+
+@app.get("/auth/me")
+def auth_me(company: Annotated[dict[str, Any], Depends(get_current_company)]):
+    return {
+        "id": company["id"],
+        "email": company["email"],
+        "company_name": company["company_name"],
+        **trial_info(company),
+    }
+
+
+# --- DPA ---
+
+
+@app.post("/dpa/accept")
+def dpa_accept(company: Annotated[dict[str, Any], Depends(get_current_company)]):
+    company["dpa_accepted"] = True
+    company["dpa_accepted_at"] = utcnow()
+    replace_company(company)
+    return {"ok": True, **trial_info(company)}
+
+
+# --- Pricing info ---
+
+
+@app.get("/pricing")
+def pricing_public():
+    return {
+        "free_cvs": FREE_CV_LIMIT,
+        "description": "First 10 CVs are always free",
+        "plans": [
+            {"id": "starter", "name": "Starter", "price_eur": 50, "credits": 100},
+            {"id": "professional", "name": "Professional", "price_eur": 300, "credits": 1000},
+        ],
+    }
+
+
+# --- Credits ---
+
+
+@app.get("/credits/balance")
+def credits_balance(company: Annotated[dict[str, Any], Depends(get_current_company)]):
+    return trial_info(company)
+
+
+@app.post("/credits/purchase")
+def credits_purchase(
+    body: CreditPurchaseBody,
+    company: Annotated[dict[str, Any], Depends(get_current_company)],
+):
+    if body.plan == "starter":
+        price = settings.stripe_price_starter
+        credits = settings.starter_credits
+    else:
+        price = settings.stripe_price_professional
+        credits = settings.professional_credits
+    base = settings.public_app_url.rstrip("/")
+    checkout = stripe.checkout.Session.create(
+        mode="payment",
+        line_items=[{"price": price, "quantity": 1}],
+        success_url=f"{base}/dashboard?paid=1",
+        cancel_url=f"{base}/pricing?cancel=1",
+        client_reference_id=company["id"],
+        metadata={"company_id": company["id"], "credits": str(credits)},
+    )
+    return {"checkout_url": checkout.url, "session_id": checkout.id}
+
+
+@app.post("/api/stripe/webhook")
+async def stripe_webhook(request: Request):
+    payload = await request.body()
+    sig = request.headers.get("stripe-signature")
+    if not sig:
+        raise HTTPException(400, "Missing stripe-signature")
+    try:
+        event = stripe.Webhook.construct_event(
+            payload=payload, sig_header=sig, secret=settings.stripe_webhook_secret
+        )
+    except ValueError:
+        raise HTTPException(400, "Invalid payload")
+    except stripe.error.SignatureVerificationError:
+        raise HTTPException(400, "Invalid signature")
+
+    if event["type"] == "checkout.session.completed":
+        session = event["data"]["object"]
+        meta = session.get("metadata") or {}
+        cid = meta.get("company_id") or session.get("client_reference_id")
+        credits_add = int(meta.get("credits", 0))
+        if cid and credits_add > 0:
+            company = load_company(cid)
+            company["credits"] = int(company.get("credits", 0)) + credits_add
+            replace_company(company)
+            tx = {
+                "id": str(uuid.uuid4()),
+                "company_id": cid,
+                "stripe_session_id": session.get("id"),
+                "credits_added": credits_add,
+                "created_at": utcnow(),
+            }
+            _tx_c.create_item(body=tx)
+    return {"received": True}
+
+
+# --- Jobs ---
+
+
+@app.get("/jobs", response_model=list[JobOut])
+def list_jobs(company: Annotated[dict[str, Any], Depends(get_current_company)]):
+    require_dpa(company)
+    cid = company["id"]
+    items = query_partition(
+        _jobs_c,
+        cid,
+        "SELECT * FROM c WHERE c.company_id = @cid ORDER BY c.created_at DESC",
+        [{"name": "@cid", "value": cid}],
+    )
+    return [
+        JobOut(
+            id=i["id"],
+            company_id=i["company_id"],
+            title=i["title"],
+            requirements=i["requirements"],
+            created_at=i["created_at"],
+        )
+        for i in items
+    ]
+
+
+@app.post("/jobs", response_model=JobOut)
+def create_job(
+    body: JobCreate,
+    company: Annotated[dict[str, Any], Depends(get_current_company)],
+):
+    require_dpa(company)
+    jid = str(uuid.uuid4())
+    cid = company["id"]
+    doc = {
+        "id": jid,
+        "company_id": cid,
+        "title": body.title.strip(),
+        "requirements": body.requirements.strip(),
+        "created_at": utcnow(),
+    }
+    _jobs_c.create_item(body=doc)
+    return JobOut(
+        id=jid,
+        company_id=cid,
+        title=doc["title"],
+        requirements=doc["requirements"],
+        created_at=doc["created_at"],
+    )
+
+
+@app.delete("/jobs/{job_id}")
+def delete_job(
+    job_id: str,
+    company: Annotated[dict[str, Any], Depends(get_current_company)],
+):
+    require_dpa(company)
+    cid = company["id"]
+    try:
+        _jobs_c.read_item(item=job_id, partition_key=cid)
+    except Exception:
+        raise HTTPException(404, "Job not found")
+    cvs = query_partition(
+        _cvs_c,
+        cid,
+        "SELECT * FROM c WHERE c.company_id = @cid AND c.job_id = @jid",
+        [{"name": "@cid", "value": cid}, {"name": "@jid", "value": job_id}],
+    )
+    company_fresh = load_company(cid)
+    refunds = 0
+    trial_reversals = 0
+    for cv in cvs:
+        if cv.get("status") != "ranked":
+            if cv.get("used_free_slot"):
+                trial_reversals += 1
+            else:
+                refunds += 1
+        bp = cv.get("blob_path")
+        if bp:
+            delete_cv(_blob, bp)
+        _cvs_c.delete_item(item=cv["id"], partition_key=cid)
+
+    company_fresh["credits"] = int(company_fresh.get("credits", 0)) + refunds
+    company_fresh["cvs_processed"] = max(
+        0, int(company_fresh.get("cvs_processed", 0)) - refunds - trial_reversals
+    )
+    replace_company(company_fresh)
+    _jobs_c.delete_item(item=job_id, partition_key=cid)
+    _blob.delete_all_for_job(cid, job_id)
+    return {"ok": True, "credits_refunded": refunds, "trial_slots_restored": trial_reversals}
+
+
+@app.post("/jobs/{job_id}/cvs")
+async def upload_cv(
+    job_id: str,
+    background_tasks: BackgroundTasks,
+    company: Annotated[dict[str, Any], Depends(get_current_company)],
+    file: UploadFile = File(...),
+):
+    require_dpa(company)
+    cid = company["id"]
+    try:
+        _jobs_c.read_item(item=job_id, partition_key=cid)
+    except Exception:
+        raise HTTPException(404, "Job not found")
+
+    company_fresh = load_company(cid)
+    processed = int(company_fresh.get("cvs_processed", 0))
+    credits = int(company_fresh.get("credits", 0))
+
+    if processed < FREE_CV_LIMIT:
+        used_free_slot = True
+        company_fresh["cvs_processed"] = processed + 1
+    elif credits > 0:
+        used_free_slot = False
+        company_fresh["credits"] = credits - 1
+        company_fresh["cvs_processed"] = processed + 1
+    else:
+        raise HTTPException(
+            status.HTTP_402_PAYMENT_REQUIRED,
+            "No credits remaining. Trial used (10 free CVs). Please purchase credits to continue.",
+        )
+    replace_company(company_fresh)
+
+    raw = await file.read()
+    if not raw:
+        _reverse_cv_consumption(load_company(cid), used_free_slot)
+        raise HTTPException(400, "Empty file")
+
+    fname = file.filename or "cv.pdf"
+    safe_name = fname.replace("\\", "_").replace("/", "_")[:200]
+    blob_key = f"{uuid.uuid4()}_{safe_name}"
+
+    try:
+        path = _blob.upload_cv(cid, job_id, blob_key, raw)
+    except Exception:
+        _reverse_cv_consumption(load_company(cid), used_free_slot)
+        raise
+
+    cv_id = str(uuid.uuid4())
+    cv_doc = {
+        "id": cv_id,
+        "company_id": cid,
+        "job_id": job_id,
+        "filename": safe_name,
+        "blob_path": path,
+        "status": "ranking",
+        "score": None,
+        "reasoning": None,
+        "error_message": None,
+        "used_free_slot": used_free_slot,
+        "created_at": utcnow(),
+        "updated_at": utcnow(),
+    }
+    _cvs_c.create_item(body=cv_doc)
+    background_tasks.add_task(process_cv_ranking, cid, cv_id, used_free_slot)
+    return {"id": cv_id, "status": "ranking", "filename": safe_name}
+
+
+@app.get("/jobs/{job_id}/cvs")
+def list_cvs(
+    job_id: str,
+    company: Annotated[dict[str, Any], Depends(get_current_company)],
+):
+    require_dpa(company)
+    cid = company["id"]
+    try:
+        _jobs_c.read_item(item=job_id, partition_key=cid)
+    except Exception:
+        raise HTTPException(404, "Job not found")
+    items = query_partition(
+        _cvs_c,
+        cid,
+        "SELECT * FROM c WHERE c.company_id = @cid AND c.job_id = @jid",
+        [{"name": "@cid", "value": cid}, {"name": "@jid", "value": job_id}],
+    )
+
+    def sort_key(i: dict[str, Any]) -> tuple[int, str]:
+        sc = i.get("score")
+        if sc is None:
+            return (-1, i.get("created_at", ""))
+        return (-int(sc), i.get("created_at", ""))
+
+    items_sorted = sorted(items, key=sort_key)
+    note = (
+        "All CVs displayed. Ranking score is for prioritization only, not exclusion. "
+        "GDPR Article 22 compliant."
+    )
+    return {
+        "note": note,
+        "cvs": [
+            {
+                "id": i["id"],
+                "filename": i.get("filename"),
+                "status": i.get("status"),
+                "score": i.get("score"),
+                "reasoning": i.get("reasoning"),
+                "error_message": i.get("error_message"),
+                "created_at": i.get("created_at"),
+            }
+            for i in items_sorted
+        ],
+    }
+
+
+@app.delete("/account")
+def delete_account(company: Annotated[dict[str, Any], Depends(get_current_company)]):
+    cid = company["id"]
+    _blob.delete_all_for_company(cid)
+    for container, pk_field in (
+        (_cvs_c, "company_id"),
+        (_jobs_c, "company_id"),
+        (_tx_c, "company_id"),
+    ):
+        for item in query_partition(container, cid, "SELECT c.id FROM c WHERE c.company_id = @cid", [{"name": "@cid", "value": cid}]):
+            container.delete_item(item=item["id"], partition_key=cid)
+    _companies.delete_item(item=cid, partition_key=cid)
+    return {"ok": True, "message": "Account and associated data deletion initiated."}
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+# OAuth2 token endpoint expects form; add JSON login alias for frontend convenience
+class LoginJson(BaseModel):
+    email: EmailStr
+    password: str
+
+
+@app.post("/auth/login/json")
+def auth_login_json(body: LoginJson):
+    email = body.email.lower().strip()
+    found: dict[str, Any] | None = None
+    for item in _companies.query_items(
+        query="SELECT * FROM c WHERE c.email = @e",
+        parameters=[{"name": "@e", "value": email}],
+        enable_cross_partition_query=True,
+    ):
+        found = item
+        break
+    if not found or not verify_password(body.password, found["password_hash"]):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Incorrect email or password")
+    token = create_access_token(found["id"])
+    return {"access_token": token, "token_type": "bearer", **trial_info(found)}

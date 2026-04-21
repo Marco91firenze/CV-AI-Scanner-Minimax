@@ -1,0 +1,342 @@
+"use client";
+
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { useRouter } from "next/navigation";
+import {
+  createJob,
+  deleteAccount,
+  deleteJob,
+  fetchBalance,
+  fetchCvs,
+  fetchJobs,
+  fetchMe,
+  getToken,
+  setToken,
+  uploadCv,
+  type CVRow,
+  type Job,
+  type TrialInfo,
+} from "@/lib/api";
+import { CreditBadge } from "@/components/CreditBadge";
+import { CVTable } from "@/components/CVTable";
+import { JobCard } from "@/components/JobCard";
+import { Modal } from "@/components/Modal";
+
+export default function DashboardPage() {
+  const router = useRouter();
+  const [trial, setTrial] = useState<TrialInfo | null>(null);
+  const [jobs, setJobs] = useState<Job[]>([]);
+  const [selectedJob, setSelectedJob] = useState<string | null>(null);
+  const [cvs, setCvs] = useState<CVRow[]>([]);
+  const [note, setNote] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [newTitle, setNewTitle] = useState("");
+  const [newReq, setNewReq] = useState("");
+  const [uploadPct, setUploadPct] = useState<number | null>(null);
+  const [delJobOpen, setDelJobOpen] = useState(false);
+  const [delAccountOpen, setDelAccountOpen] = useState(false);
+
+  const refreshTrial = useCallback(async () => {
+    const b = await fetchBalance();
+    setTrial(b);
+  }, []);
+
+  const loadJobs = useCallback(async () => {
+    const j = await fetchJobs();
+    setJobs(j);
+    setSelectedJob((prev) => prev ?? (j[0]?.id ?? null));
+  }, []);
+
+  const loadCvs = useCallback(async () => {
+    if (!selectedJob) {
+      setCvs([]);
+      return;
+    }
+    const r = await fetchCvs(selectedJob);
+    setNote(r.note);
+    setCvs(r.cvs);
+  }, [selectedJob]);
+
+  useEffect(() => {
+    if (!getToken()) {
+      router.replace("/login");
+      return;
+    }
+    (async () => {
+      try {
+        const me = await fetchMe();
+        if (!me.dpa_accepted) {
+          router.replace("/dpa");
+          return;
+        }
+        setTrial({
+          credits: me.credits,
+          free_cvs_remaining: me.free_cvs_remaining,
+          free_cvs_used: me.free_cvs_used,
+          free_cvs_total: me.free_cvs_total,
+          is_trial_active: me.is_trial_active,
+          cvs_processed: me.cvs_processed,
+          dpa_accepted: me.dpa_accepted,
+        });
+        await loadJobs();
+      } catch {
+        setToken(null);
+        router.replace("/login");
+      } finally {
+        setLoading(false);
+      }
+    })();
+  }, [router, loadJobs]);
+
+  useEffect(() => {
+    if (!selectedJob || loading) return;
+    let cancelled = false;
+    const tick = async () => {
+      try {
+        await loadCvs();
+        await refreshTrial();
+      } catch {
+        /* ignore poll errors */
+      }
+    };
+    tick();
+    const id = setInterval(() => {
+      if (!cancelled) tick();
+    }, 4000);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, [selectedJob, loading, loadCvs, refreshTrial]);
+
+  const selected = useMemo(() => jobs.find((j) => j.id === selectedJob), [jobs, selectedJob]);
+
+  async function onCreateJob(e: React.FormEvent) {
+    e.preventDefault();
+    setError(null);
+    try {
+      const j = await createJob(newTitle, newReq);
+      setNewTitle("");
+      setNewReq("");
+      setJobs((prev) => [j, ...prev]);
+      setSelectedJob(j.id);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not create job");
+    }
+  }
+
+  async function onUpload(file: File) {
+    if (!selectedJob) return;
+    setError(null);
+    setUploadPct(0);
+    try {
+      await uploadCv(selectedJob, file, (p) => setUploadPct(p));
+      await loadCvs();
+      await refreshTrial();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Upload failed");
+    } finally {
+      setUploadPct(null);
+    }
+  }
+
+  async function confirmDeleteJob() {
+    if (!selectedJob) return;
+    setError(null);
+    try {
+      await deleteJob(selectedJob);
+      setDelJobOpen(false);
+      setSelectedJob(null);
+      await loadJobs();
+      await refreshTrial();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Delete failed");
+    }
+  }
+
+  async function confirmDeleteAccount() {
+    setError(null);
+    try {
+      await deleteAccount();
+      setToken(null);
+      router.replace("/");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Account deletion failed");
+    }
+  }
+
+  if (loading || !trial) {
+    return (
+      <div className="mx-auto max-w-6xl px-4 py-24 text-center text-slate-600">Loading workspace…</div>
+    );
+  }
+
+  return (
+    <div className="mx-auto max-w-6xl px-4 py-10">
+      <div className="flex flex-col justify-between gap-4 md:flex-row md:items-center">
+        <div>
+          <h1 className="text-2xl font-bold text-slate-900">Dashboard</h1>
+          <p className="text-sm text-slate-600">
+            All CVs are shown. Scores sort the list only — no candidate is hidden by automation.
+          </p>
+        </div>
+        <button
+          type="button"
+          onClick={() => setDelAccountOpen(true)}
+          className="text-sm font-semibold text-red-700 hover:underline"
+        >
+          Delete account
+        </button>
+      </div>
+
+      <div className="mt-6">
+        <CreditBadge trial={trial} />
+      </div>
+
+      {note ? (
+        <p className="mt-4 rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700">
+          {note}
+        </p>
+      ) : null}
+
+      {error ? <p className="mt-4 text-sm text-red-600">{error}</p> : null}
+
+      <div className="mt-8 grid gap-8 lg:grid-cols-[280px,1fr]">
+        <aside className="space-y-6">
+          <div>
+            <h2 className="text-sm font-semibold text-slate-900">Jobs</h2>
+            <div className="mt-3 flex max-h-[360px] flex-col gap-2 overflow-y-auto pr-1">
+              {jobs.map((j) => (
+                <JobCard key={j.id} job={j} selected={j.id === selectedJob} onSelect={setSelectedJob} />
+              ))}
+              {jobs.length === 0 ? (
+                <p className="text-sm text-slate-500">Create your first job to upload CVs.</p>
+              ) : null}
+            </div>
+          </div>
+          <form onSubmit={onCreateJob} className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
+            <h3 className="text-sm font-semibold text-slate-900">New job</h3>
+            <input
+              placeholder="Title"
+              value={newTitle}
+              onChange={(e) => setNewTitle(e.target.value)}
+              required
+              className="mt-2 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
+            />
+            <textarea
+              placeholder="Requirements / role brief"
+              value={newReq}
+              onChange={(e) => setNewReq(e.target.value)}
+              required
+              rows={4}
+              className="mt-2 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
+            />
+            <button
+              type="submit"
+              className="mt-2 w-full rounded-lg bg-brand-600 py-2 text-sm font-semibold text-white hover:bg-brand-700"
+            >
+              Add job
+            </button>
+          </form>
+        </aside>
+
+        <section className="space-y-4">
+          {selected ? (
+            <>
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <h2 className="text-xl font-bold text-slate-900">{selected.title}</h2>
+                  <p className="text-xs text-slate-500">
+                    {cvs.length} CV{cvs.length === 1 ? "" : "s"} for this role
+                  </p>
+                </div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <label className="inline-flex cursor-pointer items-center rounded-lg bg-brand-600 px-4 py-2 text-sm font-semibold text-white hover:bg-brand-700">
+                    Upload CV
+                    <input
+                      type="file"
+                      accept=".pdf,.docx"
+                      className="hidden"
+                      onChange={(e) => {
+                        const f = e.target.files?.[0];
+                        if (f) onUpload(f);
+                        e.target.value = "";
+                      }}
+                    />
+                  </label>
+                  <button
+                    type="button"
+                    onClick={() => setDelJobOpen(true)}
+                    className="rounded-lg border border-red-200 bg-red-50 px-4 py-2 text-sm font-semibold text-red-800 hover:bg-red-100"
+                  >
+                    Delete job
+                  </button>
+                </div>
+              </div>
+              {uploadPct != null ? (
+                <div className="text-sm text-slate-600">Uploading… {uploadPct}%</div>
+              ) : null}
+              <CVTable cvs={cvs} />
+            </>
+          ) : (
+            <p className="text-sm text-slate-600">Select or create a job to manage CVs.</p>
+          )}
+        </section>
+      </div>
+
+      <Modal
+        open={delJobOpen}
+        title="Delete this job?"
+        onClose={() => setDelJobOpen(false)}
+        footer={
+          <>
+            <button
+              type="button"
+              className="rounded-lg px-3 py-2 text-sm text-slate-700 hover:bg-slate-100"
+              onClick={() => setDelJobOpen(false)}
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              className="rounded-lg bg-red-600 px-3 py-2 text-sm font-semibold text-white hover:bg-red-700"
+              onClick={confirmDeleteJob}
+            >
+              Delete permanently
+            </button>
+          </>
+        }
+      >
+        This will permanently delete all {cvs.length} CV{cvs.length === 1 ? "" : "s"} for this job,
+        including any stored files and metadata. This cannot be undone.
+      </Modal>
+
+      <Modal
+        open={delAccountOpen}
+        title="Delete your company account?"
+        onClose={() => setDelAccountOpen(false)}
+        footer={
+          <>
+            <button
+              type="button"
+              className="rounded-lg px-3 py-2 text-sm text-slate-700 hover:bg-slate-100"
+              onClick={() => setDelAccountOpen(false)}
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              className="rounded-lg bg-red-600 px-3 py-2 text-sm font-semibold text-white hover:bg-red-700"
+              onClick={confirmDeleteAccount}
+            >
+              Delete account
+            </button>
+          </>
+        }
+      >
+        Complete account deletion removes jobs, CV records, and encrypted files associated with your tenant.
+      </Modal>
+    </div>
+  );
+}
