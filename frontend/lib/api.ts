@@ -151,10 +151,29 @@ export async function createJob(body: CreateJobBody) {
 }
 
 export async function deleteJob(jobId: string) {
-  return request<{ ok: boolean; credits_refunded: number; trial_slots_restored: number }>(
-    `/jobs/${jobId}`,
-    { method: "DELETE" }
-  );
+  const t = getToken();
+  if (!t) {
+    throw new Error("Not signed in");
+  }
+  const res = await fetch(`/api/jobs/${encodeURIComponent(jobId)}`, {
+    method: "DELETE",
+    headers: { Authorization: `Bearer ${t}` },
+  });
+  if (!res.ok) {
+    let detail = res.statusText;
+    try {
+      const j = await res.json();
+      if (j?.detail) detail = typeof j.detail === "string" ? j.detail : JSON.stringify(j.detail);
+    } catch {
+      /* ignore */
+    }
+    throw new Error(detail);
+  }
+  return (await res.json()) as {
+    ok: boolean;
+    credits_refunded: number;
+    trial_slots_restored: number;
+  };
 }
 
 export async function fetchCvs(jobId: string) {
@@ -166,16 +185,16 @@ export async function uploadCv(
   file: File,
   onProgress?: (p: number) => void
 ): Promise<{ id: string; status: string; filename: string }> {
-  if (!API) {
-    throw new Error(missingApiMsg);
-  }
   const t = getToken();
+  if (!t) {
+    throw new Error("Not signed in");
+  }
   const fd = new FormData();
   fd.append("file", file);
   onProgress?.(0);
-  const res = await fetch(`${API}/jobs/${jobId}/cvs`, {
+  const res = await fetch(`/api/jobs/${encodeURIComponent(jobId)}/cvs`, {
     method: "POST",
-    headers: t ? { Authorization: `Bearer ${t}` } : {},
+    headers: { Authorization: `Bearer ${t}` },
     body: fd,
   });
   onProgress?.(100);

@@ -16,16 +16,17 @@ export function Modal({ open, title, children, onClose, footer }: ModalProps) {
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
       <button
         type="button"
-        className="absolute inset-0 bg-slate-900/40"
+        className="absolute inset-0 z-0 cursor-default bg-slate-900/40"
         aria-label="Close dialog backdrop"
         onClick={onClose}
       />
       <div
         className={cn(
-          "relative z-10 w-full max-w-lg rounded-xl border border-slate-200 bg-white p-6 shadow-xl"
+          "relative z-10 w-full max-w-lg rounded-xl border border-slate-200 bg-white p-6 shadow-xl pointer-events-auto"
         )}
         role="dialog"
         aria-modal="true"
+        onMouseDown={(e) => e.stopPropagation()}
       >
         <div className="mb-4 flex items-start justify-between gap-4">
           <h2 className="text-lg font-semibold text-slate-900">{title}</h2>

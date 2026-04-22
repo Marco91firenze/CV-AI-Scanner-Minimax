@@ -43,6 +43,7 @@ export default function DashboardPage() {
   const [bonusLangs, setBonusLangs] = useState<JobLanguage[]>([]);
   const [uploadPct, setUploadPct] = useState<number | null>(null);
   const [delJobOpen, setDelJobOpen] = useState(false);
+  const [delJobBusy, setDelJobBusy] = useState(false);
   const [delAccountOpen, setDelAccountOpen] = useState(false);
 
   const refreshTrial = useCallback(async () => {
@@ -173,7 +174,8 @@ export default function DashboardPage() {
   }
 
   async function confirmDeleteJob() {
-    if (!selectedJob) return;
+    if (!selectedJob || delJobBusy) return;
+    setDelJobBusy(true);
     setError(null);
     try {
       await deleteJob(selectedJob);
@@ -183,6 +185,8 @@ export default function DashboardPage() {
       await refreshTrial();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Delete failed");
+    } finally {
+      setDelJobBusy(false);
     }
   }
 
@@ -361,22 +365,24 @@ export default function DashboardPage() {
       <Modal
         open={delJobOpen}
         title="Delete this job?"
-        onClose={() => setDelJobOpen(false)}
+        onClose={() => (delJobBusy ? undefined : setDelJobOpen(false))}
         footer={
           <>
             <button
               type="button"
-              className="rounded-lg px-3 py-2 text-sm text-slate-700 hover:bg-slate-100"
+              disabled={delJobBusy}
+              className="rounded-lg px-3 py-2 text-sm text-slate-700 hover:bg-slate-100 disabled:opacity-50"
               onClick={() => setDelJobOpen(false)}
             >
               Cancel
             </button>
             <button
               type="button"
-              className="rounded-lg bg-red-600 px-3 py-2 text-sm font-semibold text-white hover:bg-red-700"
-              onClick={confirmDeleteJob}
+              disabled={delJobBusy}
+              className="rounded-lg bg-red-600 px-3 py-2 text-sm font-semibold text-white hover:bg-red-700 disabled:opacity-50"
+              onClick={() => void confirmDeleteJob()}
             >
-              Delete permanently
+              {delJobBusy ? "Deleting…" : "Delete permanently"}
             </button>
           </>
         }
