@@ -9,7 +9,7 @@ export default function HomePage() {
             B2B SaaS · EU-first · GDPR-aware
           </p>
           <h1 className="mt-4 max-w-3xl text-4xl font-bold tracking-tight text-slate-900 md:text-5xl">
-            Rank CVs with AI — without automating people out.
+            Rank CVs with our AI job fit check - 100% GDPR Compliant
           </h1>
           <p className="mt-6 max-w-2xl text-lg text-slate-600">
             Upload CVs, compare them to your role brief, and get transparent scores for{" "}
