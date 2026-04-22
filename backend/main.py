@@ -732,7 +732,8 @@ def presign_cv_upload(
         settings.jwt_secret,
         algorithm=settings.jwt_algorithm,
     )
-    return {"put_url": put_url, "token": tok, "headers": {"Content-Type": ct}}
+    # No upload headers: browser must not send Content-Type on PUT (simpler CORS preflight).
+    return {"put_url": put_url, "token": tok, "headers": {}}
 
 
 @app.post("/jobs/{job_id}/cvs/finalize")

@@ -213,10 +213,11 @@ function putFileToPresignedUrl(
     xhr.onerror = () =>
       reject(
         new Error(
-          "Could not upload file to storage (network). If the API works but upload fails here, configure S3/R2 CORS for browser PUT."
+          "Could not upload file to storage (usually S3/R2 CORS). In DevTools → Network, open the red OPTIONS request to your storage host: fix bucket CORS to allow this site’s origin, method PUT, and AllowedHeaders *."
         )
       );
-    xhr.send(file);
+    // Untyped blob avoids Content-Type on the PUT so preflight does not require content-type.
+    xhr.send(new Blob([file], { type: "" }));
   });
 }
 

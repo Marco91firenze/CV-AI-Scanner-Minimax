@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 import boto3
+from botocore.config import Config
 from botocore.exceptions import ClientError
 
 from lib.encryption import decrypt_bytes, encrypt_bytes
@@ -27,9 +28,16 @@ class ObjectStorage:
             "aws_access_key_id": access_key_id,
             "aws_secret_access_key": secret_access_key,
             "region_name": eff_region,
+            "config": Config(signature_version="s3v4", s3={"addressing_style": "virtual"}),
         }
         if endpoint_url:
             kw["endpoint_url"] = endpoint_url.rstrip("/")
+        else:
+            # Regional endpoint avoids odd DNS/CORS behaviour with bucket.s3.amazonaws.com on some buckets.
+            sign_region = eff_region if eff_region not in ("", "auto") else "eu-central-1"
+            kw["endpoint_url"] = f"https://s3.{sign_region}.amazonaws.com"
+            if eff_region == "auto":
+                kw["region_name"] = sign_region
         self._client = boto3.client("s3", **kw)
         self._bucket = bucket
         self._enc_key = encryption_key_b64
