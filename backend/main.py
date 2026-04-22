@@ -49,6 +49,8 @@ class Settings(BaseSettings):
     jwt_algorithm: str = Field("HS256", alias="JWT_ALGORITHM")
     access_token_expire_minutes: int = Field(10080, alias="ACCESS_TOKEN_EXPIRE_MINUTES")
     cors_origins: str = Field("http://localhost:3000", alias="CORS_ORIGINS")
+    # Allow any https://*.vercel.app origin (prod + preview URLs). Disable with CORS_ALLOW_VERCEL_APP=false.
+    cors_allow_vercel_app: bool = Field(True, alias="CORS_ALLOW_VERCEL_APP")
 
     mongodb_uri: str = Field(..., alias="MONGODB_URI")
     mongodb_database: str = Field("ai_cv_scanner", alias="MONGODB_DATABASE")
@@ -122,7 +124,8 @@ app = FastAPI(title="AI CV Scanner API")
 @app.middleware("http")
 async def lazy_init_backend(request: Request, call_next):
     path = request.url.path.rstrip("/") or "/"
-    if path != "/health":
+    # OPTIONS preflight must not block on Mongo/S3 init (and should match CORS before routes).
+    if path != "/health" and request.method != "OPTIONS":
         _ensure_backend()
     return await call_next(request)
 
@@ -144,7 +147,11 @@ def _allowed_cors_origins() -> list[str]:
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_allowed_cors_origins(),
-    allow_credentials=True,
+    allow_origin_regex=r"https://.*\.vercel\.app$"
+    if settings.cors_allow_vercel_app
+    else None,
+    # JWT is sent via Authorization header, not cookies — omitting credentials avoids stricter CORS edge cases.
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
