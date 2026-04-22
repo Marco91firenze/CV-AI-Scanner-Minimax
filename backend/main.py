@@ -83,7 +83,7 @@ settings = get_settings()
 stripe.api_key = settings.stripe_secret_key
 
 _init_lock = threading.Lock()
-_backend_ready = False
+_mongo_ready = False
 _mongo_client: MongoClient | None = None
 _db: Database | None = None
 _companies: Any = None
@@ -93,19 +93,31 @@ _transactions: Any = None
 _storage: ObjectStorage | None = None
 
 
-def _ensure_backend() -> None:
-    """Connect to MongoDB and S3 on first real request so /health can pass Railway before Atlas is reachable."""
-    global _backend_ready, _mongo_client, _db, _companies, _jobs, _cvs, _transactions, _storage
-    if _backend_ready:
+def _ensure_mongo() -> None:
+    """Connect to MongoDB on first request so /health can pass before Atlas is reachable."""
+    global _mongo_ready, _mongo_client, _db, _companies, _jobs, _cvs, _transactions
+    if _mongo_ready:
         return
     with _init_lock:
-        if _backend_ready:
+        if _mongo_ready:
             return
         _mongo_client, _db = connect(settings.mongodb_uri, settings.mongodb_database)
         _companies = col_companies(_db)
         _jobs = col_jobs(_db)
         _cvs = col_cvs(_db)
         _transactions = col_transactions(_db)
+        _mongo_ready = True
+
+
+def _ensure_storage() -> None:
+    """S3 client only when uploads/deletes need it — keeps auth/register working if S3 env is wrong."""
+    global _storage
+    _ensure_mongo()
+    if _storage is not None:
+        return
+    with _init_lock:
+        if _storage is not None:
+            return
         _storage = ObjectStorage(
             bucket=settings.s3_bucket,
             access_key_id=settings.s3_access_key_id,
@@ -115,7 +127,6 @@ def _ensure_backend() -> None:
             encryption_key_b64=settings.cv_encryption_key,
         )
         _storage.ensure_bucket_exists()
-        _backend_ready = True
 
 
 app = FastAPI(title="AI CV Scanner API")
@@ -124,9 +135,9 @@ app = FastAPI(title="AI CV Scanner API")
 @app.middleware("http")
 async def lazy_init_backend(request: Request, call_next):
     path = request.url.path.rstrip("/") or "/"
-    # OPTIONS preflight must not block on Mongo/S3 init (and should match CORS before routes).
+    # OPTIONS preflight must not block on DB init (and should match CORS before routes).
     if path != "/health" and request.method != "OPTIONS":
-        _ensure_backend()
+        _ensure_mongo()
     return await call_next(request)
 
 
@@ -276,6 +287,7 @@ def process_cv_ranking(
     cv_id: str,
     used_free_slot: bool,
 ) -> None:
+    _ensure_storage()
     company = load_company(company_id)
     cv = _cvs.find_one({"id": cv_id, "company_id": company_id})
     if not cv:
@@ -510,6 +522,7 @@ def delete_job(
     job_id: str,
     company: Annotated[dict[str, Any], Depends(get_current_company)],
 ):
+    _ensure_storage()
     require_dpa(company)
     cid = company["id"]
     if not _jobs.find_one({"id": job_id, "company_id": cid}):
@@ -578,6 +591,7 @@ async def upload_cv(
     safe_name = fname.replace("\\", "_").replace("/", "_")[:200]
     blob_key = f"{uuid.uuid4()}_{safe_name}"
 
+    _ensure_storage()
     try:
         path = _storage.upload_cv(cid, job_id, blob_key, raw)
     except Exception:
@@ -645,6 +659,7 @@ def list_cvs(
 
 @app.delete("/account")
 def delete_account(company: Annotated[dict[str, Any], Depends(get_current_company)]):
+    _ensure_storage()
     cid = company["id"]
     _storage.delete_all_for_company(cid)
     _cvs.delete_many({"company_id": cid})
