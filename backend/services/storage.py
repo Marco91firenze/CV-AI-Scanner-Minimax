@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import boto3
 from botocore.exceptions import ClientError
 
@@ -60,6 +62,24 @@ class ObjectStorage:
             self._client.delete_object(Bucket=self._bucket, Key=key)
         except ClientError:
             pass
+
+    def presigned_put_url(self, key: str, content_type: str, expires: int = 900) -> str:
+        return self._client.generate_presigned_url(
+            "put_object",
+            Params={"Bucket": self._bucket, "Key": key, "ContentType": content_type},
+            ExpiresIn=expires,
+            HttpMethod="PUT",
+        )
+
+    def head_object_meta(self, key: str) -> dict[str, Any] | None:
+        try:
+            return self._client.head_object(Bucket=self._bucket, Key=key)
+        except ClientError:
+            return None
+
+    def get_plaintext_object(self, key: str) -> bytes:
+        resp = self._client.get_object(Bucket=self._bucket, Key=key)
+        return resp["Body"].read()
 
     def delete_all_for_job(self, company_id: str, job_id: str) -> None:
         prefix = f"tenants/{company_id}/jobs/{job_id}/"

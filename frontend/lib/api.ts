@@ -180,6 +180,46 @@ export async function fetchCvs(jobId: string) {
   return request<{ note: string; cvs: CVRow[] }>(`/jobs/${jobId}/cvs`);
 }
 
+/** Browser PUT to presigned URL with upload progress (fetch has no upload progress). */
+function putFileToPresignedUrl(
+  url: string,
+  file: File,
+  headers: Record<string, string>,
+  onProgress?: (loadedRatio: number) => void
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("PUT", url);
+    for (const [k, v] of Object.entries(headers)) {
+      xhr.setRequestHeader(k, v);
+    }
+    xhr.upload.onprogress = (ev) => {
+      if (ev.lengthComputable && onProgress && ev.total > 0) {
+        onProgress(ev.loaded / ev.total);
+      }
+    };
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve();
+        return;
+      }
+      let msg = `Upload to storage failed (HTTP ${xhr.status}).`;
+      if (xhr.status === 403) {
+        msg +=
+          " Often caused by S3/R2 CORS: allow PUT from your site origin and expose Content-Type.";
+      }
+      reject(new Error(msg));
+    };
+    xhr.onerror = () =>
+      reject(
+        new Error(
+          "Could not upload file to storage (network). If the API works but upload fails here, configure S3/R2 CORS for browser PUT."
+        )
+      );
+    xhr.send(file);
+  });
+}
+
 export async function uploadCv(
   jobId: string,
   file: File,
@@ -188,31 +228,48 @@ export async function uploadCv(
   if (!API) {
     throw new Error(missingApiMsg);
   }
-  const t = getToken();
-  if (!t) {
+  if (!getToken()) {
     throw new Error("Not signed in");
   }
-  const fd = new FormData();
-  fd.append("file", file, file.name);
-  onProgress?.(0);
-  // Upload directly to Railway — Vercel serverless proxies cap request bodies (~4.5MB) and large CVs would hang/fail silently.
-  const res = await fetch(`${API}/jobs/${encodeURIComponent(jobId)}/cvs`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${t}` },
-    body: fd,
-  });
-  onProgress?.(100);
-  if (!res.ok) {
-    let detail = res.statusText;
-    try {
-      const j = await res.json();
-      if (j?.detail) detail = typeof j.detail === "string" ? j.detail : JSON.stringify(j.detail);
-    } catch {
-      /* ignore */
-    }
-    throw new Error(detail);
+  if (file.size < 1) {
+    throw new Error("File is empty.");
   }
-  return (await res.json()) as { id: string; status: string; filename: string };
+
+  onProgress?.(0);
+
+  const presign = await request<{
+    put_url: string;
+    token: string;
+    headers: Record<string, string>;
+  }>(`/jobs/${encodeURIComponent(jobId)}/cvs/presign`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      filename: file.name,
+      content_type: file.type || "",
+      size_bytes: file.size,
+    }),
+  });
+
+  onProgress?.(2);
+
+  await putFileToPresignedUrl(presign.put_url, file, presign.headers, (ratio) => {
+    onProgress?.(2 + Math.round(ratio * 88));
+  });
+
+  onProgress?.(92);
+
+  const done = await request<{ id: string; status: string; filename: string }>(
+    `/jobs/${encodeURIComponent(jobId)}/cvs/finalize`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token: presign.token }),
+    }
+  );
+
+  onProgress?.(100);
+  return done;
 }
 
 export async function purchaseCredits(plan: "starter" | "professional") {

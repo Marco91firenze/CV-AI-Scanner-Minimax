@@ -177,7 +177,11 @@ export default function DashboardPage() {
       await refreshTrial();
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Upload failed";
-      setError(msg === "Failed to fetch" ? "Upload failed to reach the API (network or CORS). Try again or use a smaller file." : msg);
+      setError(
+        msg === "Failed to fetch"
+          ? "Upload could not reach the backend (network, wrong NEXT_PUBLIC_API_URL, or API CORS). Large files use direct storage upload; if the bar moves then stops, fix S3/R2 CORS for PUT from your site."
+          : msg
+      );
     } finally {
       setUploadPct(null);
     }

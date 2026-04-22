@@ -5,6 +5,8 @@ GDPR-oriented: tenant isolation via MongoDB queries (company_id), ephemeral CV b
 
 from __future__ import annotations
 
+import logging
+import re
 import threading
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -40,6 +42,7 @@ from services.storage import ObjectStorage, delete_cv
 FREE_CV_LIMIT = 10
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
+logger = logging.getLogger("ai_cv_scanner")
 
 
 class Settings(BaseSettings):
@@ -51,6 +54,8 @@ class Settings(BaseSettings):
     cors_origins: str = Field("http://localhost:3000", alias="CORS_ORIGINS")
     # Allow any https://*.vercel.app origin (prod + preview URLs). Disable with CORS_ALLOW_VERCEL_APP=false.
     cors_allow_vercel_app: bool = Field(True, alias="CORS_ALLOW_VERCEL_APP")
+    # Optional extra regex for custom domains, e.g. https://(www\.)?example\.com$
+    cors_allow_origin_regex_extra: str = Field("", alias="CORS_ALLOW_ORIGIN_REGEX_EXTRA")
 
     mongodb_uri: str = Field(..., alias="MONGODB_URI")
     mongodb_database: str = Field("ai_cv_scanner", alias="MONGODB_DATABASE")
@@ -73,6 +78,8 @@ class Settings(BaseSettings):
     starter_credits: int = Field(100, alias="STARTER_CREDITS")
     professional_credits: int = Field(1000, alias="PROFESSIONAL_CREDITS")
     public_app_url: str = Field("http://localhost:3000", alias="PUBLIC_APP_URL")
+    # Browser uploads go directly to S3/R2 (presigned PUT); this caps size server-side at finalize.
+    max_cv_upload_bytes: int = Field(55 * 1024 * 1024, alias="MAX_CV_UPLOAD_BYTES")
 
 
 def get_settings() -> Settings:
@@ -157,17 +164,43 @@ def _allowed_cors_origins() -> list[str]:
     return out
 
 
+def _cors_allow_origin_regex() -> str | None:
+    parts: list[str] = []
+    if settings.cors_allow_vercel_app:
+        parts.append(r"https://.*\.vercel\.app$")
+    extra = settings.cors_allow_origin_regex_extra.strip()
+    if extra:
+        try:
+            re.compile(extra)
+        except re.error:
+            logger.error("Invalid CORS_ALLOW_ORIGIN_REGEX_EXTRA — ignoring: %s", extra)
+            extra = ""
+        if extra:
+            parts.append(extra)
+    if not parts:
+        return None
+    return "|".join(parts) if len(parts) > 1 else parts[0]
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_allowed_cors_origins(),
-    allow_origin_regex=r"https://.*\.vercel\.app$"
-    if settings.cors_allow_vercel_app
-    else None,
+    allow_origin_regex=_cors_allow_origin_regex(),
     # JWT is sent via Authorization header, not cookies — omitting credentials avoids stricter CORS edge cases.
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.on_event("startup")
+async def _log_cors_config() -> None:
+    """So Railway logs show effective CORS after deploy (env changes need redeploy)."""
+    logger.warning(
+        "CORS allow_origins=%s allow_origin_regex=%s",
+        _allowed_cors_origins(),
+        _cors_allow_origin_regex(),
+    )
 
 
 def utcnow() -> str:
@@ -302,6 +335,39 @@ class JobOut(BaseModel):
 
 class CreditPurchaseBody(BaseModel):
     plan: str = Field(pattern="^(starter|professional)$")
+
+
+_ALLOWED_CV_CT = frozenset(
+    {
+        "application/pdf",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    }
+)
+
+
+class CvPresignBody(BaseModel):
+    filename: str = Field(min_length=1, max_length=220)
+    content_type: str = Field(default="", max_length=128)
+    size_bytes: int = Field(ge=1)
+
+
+class CvFinalizeBody(BaseModel):
+    token: str = Field(min_length=20)
+
+
+def _normalize_cv_content_type(filename: str, declared: str) -> str:
+    lower = filename.lower()
+    if lower.endswith(".pdf"):
+        return "application/pdf"
+    if lower.endswith(".docx"):
+        return "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    d = (declared or "").strip() or "application/octet-stream"
+    if d in _ALLOWED_CV_CT:
+        return d
+    raise HTTPException(
+        status.HTTP_400_BAD_REQUEST,
+        "Only PDF and Word (.docx) CV uploads are supported.",
+    )
 
 
 def _lang_lines(items: list[dict[str, Any]]) -> str:
@@ -625,6 +691,153 @@ def delete_job(
     _jobs.delete_one({"id": job_id, "company_id": cid})
     _storage.delete_all_for_job(cid, job_id)
     return {"ok": True, "credits_refunded": refunds, "trial_slots_restored": trial_reversals}
+
+
+@app.post("/jobs/{job_id}/cvs/presign")
+def presign_cv_upload(
+    job_id: str,
+    body: CvPresignBody,
+    company: Annotated[dict[str, Any], Depends(get_current_company)],
+):
+    """Return a presigned PUT URL so the browser can upload large PDFs directly to S3/R2 (no Vercel body limit)."""
+    require_dpa(company)
+    _ensure_storage()
+    cid = company["id"]
+    if not _jobs.find_one({"id": job_id, "company_id": cid}):
+        raise HTTPException(404, "Job not found")
+    if body.size_bytes > settings.max_cv_upload_bytes:
+        raise HTTPException(
+            status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            f"File too large (max {settings.max_cv_upload_bytes // (1024 * 1024)} MB).",
+        )
+    ct = _normalize_cv_content_type(body.filename, body.content_type)
+    fname = body.filename.strip() or "cv.pdf"
+    safe_name = fname.replace("\\", "_").replace("/", "_")[:200]
+    blob_key = f"{uuid.uuid4()}_{safe_name}"
+    temp_key = f"temp-uploads/{cid}/{uuid.uuid4()}/{blob_key}"
+    assert _storage is not None
+    put_url = _storage.presigned_put_url(temp_key, ct, expires=900)
+    exp = datetime.now(timezone.utc) + timedelta(minutes=15)
+    tok = jwt.encode(
+        {
+            "typ": "cv_up",
+            "sub": cid,
+            "job_id": job_id,
+            "temp_key": temp_key,
+            "blob_key": blob_key,
+            "safe_name": safe_name,
+            "ct": ct,
+            "exp": int(exp.timestamp()),
+        },
+        settings.jwt_secret,
+        algorithm=settings.jwt_algorithm,
+    )
+    return {"put_url": put_url, "token": tok, "headers": {"Content-Type": ct}}
+
+
+@app.post("/jobs/{job_id}/cvs/finalize")
+def finalize_cv_upload(
+    job_id: str,
+    body: CvFinalizeBody,
+    background_tasks: BackgroundTasks,
+    company: Annotated[dict[str, Any], Depends(get_current_company)],
+):
+    """After the browser PUTs the file to storage, encrypt, persist CV row, and queue ranking."""
+    require_dpa(company)
+    cid = company["id"]
+    try:
+        payload = jwt.decode(
+            body.token,
+            settings.jwt_secret,
+            algorithms=[settings.jwt_algorithm],
+            options={"verify_aud": False},
+        )
+    except JWTError:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "Invalid or expired upload token. Start the upload again.",
+        )
+    if (
+        payload.get("typ") != "cv_up"
+        or payload.get("sub") != cid
+        or payload.get("job_id") != job_id
+    ):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid upload token.")
+
+    temp_key = str(payload["temp_key"])
+    blob_key = str(payload["blob_key"])
+    safe_name = str(payload["safe_name"])
+
+    if not _jobs.find_one({"id": job_id, "company_id": cid}):
+        raise HTTPException(404, "Job not found")
+
+    _ensure_storage()
+    assert _storage is not None
+    meta = _storage.head_object_meta(temp_key)
+    if not meta:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "Uploaded file not found in storage. Complete the PUT to the presigned URL first. "
+            "If it still fails, configure S3/R2 CORS to allow PUT from your frontend origin.",
+        )
+    clen = int(meta.get("ContentLength", 0))
+    if clen == 0:
+        _storage.delete_object(temp_key)
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Empty upload.")
+    if clen > settings.max_cv_upload_bytes:
+        _storage.delete_object(temp_key)
+        raise HTTPException(
+            status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            f"File too large (max {settings.max_cv_upload_bytes // (1024 * 1024)} MB).",
+        )
+
+    company_fresh = load_company(cid)
+    processed = int(company_fresh.get("cvs_processed", 0))
+    credits = int(company_fresh.get("credits", 0))
+
+    if processed < FREE_CV_LIMIT:
+        used_free_slot = True
+        company_fresh["cvs_processed"] = processed + 1
+    elif credits > 0:
+        used_free_slot = False
+        company_fresh["credits"] = credits - 1
+        company_fresh["cvs_processed"] = processed + 1
+    else:
+        raise HTTPException(
+            status.HTTP_402_PAYMENT_REQUIRED,
+            "No credits remaining. Trial used (10 free CVs). Please purchase credits to continue.",
+        )
+    replace_company(company_fresh)
+
+    try:
+        raw = _storage.get_plaintext_object(temp_key)
+        if not raw:
+            raise ValueError("empty")
+        path = _storage.upload_cv(cid, job_id, blob_key, raw)
+    except Exception:
+        _reverse_cv_consumption(load_company(cid), used_free_slot)
+        raise
+    finally:
+        _storage.delete_object(temp_key)
+
+    cv_id = str(uuid.uuid4())
+    cv_doc = {
+        "id": cv_id,
+        "company_id": cid,
+        "job_id": job_id,
+        "filename": safe_name,
+        "blob_path": path,
+        "status": "ranking",
+        "score": None,
+        "reasoning": None,
+        "error_message": None,
+        "used_free_slot": used_free_slot,
+        "created_at": utcnow(),
+        "updated_at": utcnow(),
+    }
+    _cvs.insert_one(cv_doc)
+    background_tasks.add_task(process_cv_ranking, cid, cv_id, used_free_slot)
+    return {"id": cv_id, "status": "ranking", "filename": safe_name}
 
 
 @app.post("/jobs/{job_id}/cvs")
