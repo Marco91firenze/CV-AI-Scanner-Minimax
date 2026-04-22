@@ -187,38 +187,48 @@ function putFileToPresignedUrl(
   headers: Record<string, string>,
   onProgress?: (loadedRatio: number) => void
 ): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const xhr = new XMLHttpRequest();
-    xhr.open("PUT", url);
-    for (const [k, v] of Object.entries(headers)) {
-      xhr.setRequestHeader(k, v);
-    }
-    xhr.upload.onprogress = (ev) => {
-      if (ev.lengthComputable && onProgress && ev.total > 0) {
-        onProgress(ev.loaded / ev.total);
-      }
-    };
-    xhr.onload = () => {
-      if (xhr.status >= 200 && xhr.status < 300) {
-        resolve();
-        return;
-      }
-      let msg = `Upload to storage failed (HTTP ${xhr.status}).`;
-      if (xhr.status === 403) {
-        msg +=
-          " Often caused by S3/R2 CORS: allow PUT from your site origin and expose Content-Type.";
-      }
-      reject(new Error(msg));
-    };
-    xhr.onerror = () =>
-      reject(
-        new Error(
-          "Could not upload file to storage (usually S3/R2 CORS). In DevTools → Network, open the red OPTIONS request to your storage host: fix bucket CORS to allow this site’s origin, method PUT, and AllowedHeaders *."
-        )
-      );
-    // Untyped blob avoids Content-Type on the PUT so preflight does not require content-type.
-    xhr.send(new Blob([file], { type: "" }));
-  });
+  // ArrayBuffer avoids Blob quirks; do not set Content-Type (keeps preflight minimal).
+  return file.arrayBuffer().then(
+    (buf) =>
+      new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        xhr.open("PUT", url);
+        xhr.timeout = 600_000;
+        for (const [k, v] of Object.entries(headers)) {
+          xhr.setRequestHeader(k, v);
+        }
+        xhr.upload.onprogress = (ev) => {
+          if (ev.lengthComputable && onProgress && ev.total > 0) {
+            onProgress(ev.loaded / ev.total);
+          }
+        };
+        xhr.onload = () => {
+          if (xhr.status >= 200 && xhr.status < 300) {
+            resolve();
+            return;
+          }
+          let msg = `Upload to storage failed (HTTP ${xhr.status}).`;
+          if (xhr.status === 403) {
+            msg +=
+              " Check the PUT response in Network (signature/CORS). S3 CORS must allow your origin, PUT, and AllowedHeaders *.";
+          }
+          const detail = xhr.responseText?.trim();
+          if (detail && detail.length < 800) msg += ` ${detail}`;
+          reject(new Error(msg));
+        };
+        xhr.ontimeout = () =>
+          reject(new Error("Upload to storage timed out. Try a smaller file or check your connection."));
+        xhr.onabort = () => reject(new Error("Upload was aborted."));
+        xhr.onerror = () => {
+          reject(
+            new Error(
+              "Upload to storage failed (browser blocked the PUT—often CORS or an extension). In DevTools → Network find the red PUT to amazonaws.com (not only OPTIONS): fix S3 CORS AllowedMethods PUT + AllowedHeaders * + your https origin; try Incognito with extensions off."
+            )
+          );
+        };
+        xhr.send(buf);
+      })
+  );
 }
 
 export async function uploadCv(
