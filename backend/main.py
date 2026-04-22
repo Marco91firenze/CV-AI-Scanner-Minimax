@@ -269,9 +269,21 @@ class CompanyPublic(BaseModel):
     cvs_processed: int
 
 
+class LanguageReq(BaseModel):
+    code: str = Field(min_length=2, max_length=32)
+    level: str = Field(pattern="^(A1|A2|B1|B2|C1|C2)$")
+    name: str = Field(default="", max_length=120)
+
+
 class JobCreate(BaseModel):
     title: str = Field(min_length=1, max_length=300)
     requirements: str = Field(min_length=1, max_length=50_000)
+    location: str = Field(default="", max_length=500)
+    remote_only: bool = False
+    years_experience: str = Field(default="", max_length=500)
+    mandatory_languages: list[LanguageReq] = Field(default_factory=list)
+    bonus_languages: list[LanguageReq] = Field(default_factory=list)
+    skills: str = Field(default="", max_length=10_000)
 
 
 class JobOut(BaseModel):
@@ -280,10 +292,55 @@ class JobOut(BaseModel):
     title: str
     requirements: str
     created_at: str
+    location: str = ""
+    remote_only: bool = False
+    years_experience: str = ""
+    mandatory_languages: list[dict[str, Any]] = Field(default_factory=list)
+    bonus_languages: list[dict[str, Any]] = Field(default_factory=list)
+    skills: str = ""
 
 
 class CreditPurchaseBody(BaseModel):
     plan: str = Field(pattern="^(starter|professional)$")
+
+
+def _lang_lines(items: list[dict[str, Any]]) -> str:
+    parts: list[str] = []
+    for x in items:
+        label = (str(x.get("name") or "")).strip() or str(x.get("code") or "")
+        lvl = str(x.get("level") or "")
+        if label and lvl:
+            parts.append(f"{label} (minimum {lvl})")
+    return "; ".join(parts)
+
+
+def build_job_ranking_brief(job: dict[str, Any]) -> str:
+    """Single text block passed to the ranking model (role brief + structured fields)."""
+    chunks: list[str] = []
+    req = (job.get("requirements") or "").strip()
+    if req:
+        chunks.append(req)
+    ye = (job.get("years_experience") or "").strip()
+    if ye:
+        chunks.append(f"Years of experience sought: {ye}")
+    loc = (job.get("location") or "").strip()
+    if job.get("remote_only"):
+        if loc:
+            chunks.append(f"Work arrangement: fully remote (note: {loc})")
+        else:
+            chunks.append("Work arrangement: fully remote")
+    elif loc:
+        chunks.append(f"Location: {loc}")
+    mand = job.get("mandatory_languages") or []
+    if mand:
+        chunks.append("Mandatory languages (CEFR minimum): " + _lang_lines(mand))
+    bonus = job.get("bonus_languages") or []
+    if bonus:
+        chunks.append("Languages that are a plus (CEFR minimum): " + _lang_lines(bonus))
+    skills = (job.get("skills") or "").strip()
+    if skills:
+        chunks.append(f"Skills / keywords: {skills}")
+    return "\n\n".join(chunks)
 
 
 def _reverse_cv_consumption(company: dict[str, Any], used_free_slot: bool) -> None:
@@ -316,7 +373,7 @@ def process_cv_ranking(
         result = rank_cv(
             text,
             job.get("title", ""),
-            job.get("requirements", ""),
+            build_job_ranking_brief(job),
             settings.openai_api_key,
             settings.openai_model,
         )
@@ -491,16 +548,23 @@ def list_jobs(company: Annotated[dict[str, Any], Depends(get_current_company)]):
     require_dpa(company)
     cid = company["id"]
     items = list(_jobs.find({"company_id": cid}).sort("created_at", -1))
-    return [
-        JobOut(
-            id=i["id"],
-            company_id=i["company_id"],
-            title=i["title"],
-            requirements=i["requirements"],
-            created_at=i["created_at"],
-        )
-        for i in items
-    ]
+    return [_mongo_job_to_out(i) for i in items]
+
+
+def _mongo_job_to_out(i: dict[str, Any]) -> JobOut:
+    return JobOut(
+        id=i["id"],
+        company_id=i["company_id"],
+        title=i["title"],
+        requirements=i["requirements"],
+        created_at=i["created_at"],
+        location=i.get("location") or "",
+        remote_only=bool(i.get("remote_only", False)),
+        years_experience=i.get("years_experience") or "",
+        mandatory_languages=list(i.get("mandatory_languages") or []),
+        bonus_languages=list(i.get("bonus_languages") or []),
+        skills=i.get("skills") or "",
+    )
 
 
 @app.post("/jobs", response_model=JobOut)
@@ -516,16 +580,16 @@ def create_job(
         "company_id": cid,
         "title": body.title.strip(),
         "requirements": body.requirements.strip(),
+        "location": body.location.strip(),
+        "remote_only": body.remote_only,
+        "years_experience": body.years_experience.strip(),
+        "mandatory_languages": [x.model_dump() for x in body.mandatory_languages],
+        "bonus_languages": [x.model_dump() for x in body.bonus_languages],
+        "skills": body.skills.strip(),
         "created_at": utcnow(),
     }
     _jobs.insert_one(doc)
-    return JobOut(
-        id=jid,
-        company_id=cid,
-        title=doc["title"],
-        requirements=doc["requirements"],
-        created_at=doc["created_at"],
-    )
+    return _mongo_job_to_out(doc)
 
 
 @app.delete("/jobs/{job_id}")

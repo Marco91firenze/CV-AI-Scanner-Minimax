@@ -20,6 +20,12 @@ export function JobCard({ job, selected, onSelect }: Props) {
       )}
     >
       <div className="line-clamp-2">{job.title}</div>
+      {job.remote_only || job.location ? (
+        <div className="mt-0.5 line-clamp-1 text-xs text-slate-500">
+          {job.remote_only ? "Fully remote" : job.location}
+          {job.remote_only && job.location ? ` · ${job.location}` : ""}
+        </div>
+      ) : null}
       <div className="mt-1 text-xs text-slate-500">
         {new Date(job.created_at).toLocaleDateString()}
       </div>

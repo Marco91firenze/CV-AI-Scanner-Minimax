@@ -15,11 +15,13 @@ import {
   uploadCv,
   type CVRow,
   type Job,
+  type JobLanguage,
   type TrialInfo,
 } from "@/lib/api";
 import { CreditBadge } from "@/components/CreditBadge";
 import { CVTable } from "@/components/CVTable";
 import { JobCard } from "@/components/JobCard";
+import { LanguageRowsEditor } from "@/components/LanguageRowsEditor";
 import { Modal } from "@/components/Modal";
 
 export default function DashboardPage() {
@@ -33,6 +35,12 @@ export default function DashboardPage() {
   const [error, setError] = useState<string | null>(null);
   const [newTitle, setNewTitle] = useState("");
   const [newReq, setNewReq] = useState("");
+  const [newLocation, setNewLocation] = useState("");
+  const [newRemoteOnly, setNewRemoteOnly] = useState(false);
+  const [newYearsExp, setNewYearsExp] = useState("");
+  const [newSkills, setNewSkills] = useState("");
+  const [mandatoryLangs, setMandatoryLangs] = useState<JobLanguage[]>([]);
+  const [bonusLangs, setBonusLangs] = useState<JobLanguage[]>([]);
   const [uploadPct, setUploadPct] = useState<number | null>(null);
   const [delJobOpen, setDelJobOpen] = useState(false);
   const [delAccountOpen, setDelAccountOpen] = useState(false);
@@ -116,9 +124,24 @@ export default function DashboardPage() {
     e.preventDefault();
     setError(null);
     try {
-      const j = await createJob(newTitle, newReq);
+      const j = await createJob({
+        title: newTitle,
+        requirements: newReq,
+        location: newLocation,
+        remote_only: newRemoteOnly,
+        years_experience: newYearsExp,
+        skills: newSkills,
+        mandatory_languages: mandatoryLangs,
+        bonus_languages: bonusLangs,
+      });
       setNewTitle("");
       setNewReq("");
+      setNewLocation("");
+      setNewRemoteOnly(false);
+      setNewYearsExp("");
+      setNewSkills("");
+      setMandatoryLangs([]);
+      setBonusLangs([]);
       setJobs((prev) => [j, ...prev]);
       setSelectedJob(j.id);
     } catch (err) {
@@ -126,12 +149,20 @@ export default function DashboardPage() {
     }
   }
 
-  async function onUpload(file: File) {
-    if (!selectedJob) return;
+  async function onUpload(files: File[]) {
+    if (!selectedJob || files.length === 0) return;
     setError(null);
     setUploadPct(0);
+    const n = files.length;
     try {
-      await uploadCv(selectedJob, file, (p) => setUploadPct(p));
+      for (let i = 0; i < n; i++) {
+        const file = files[i]!;
+        await uploadCv(selectedJob, file, (p) => {
+          const base = (i / n) * 100;
+          const slice = (100 / n) * (p / 100);
+          setUploadPct(Math.round(base + slice));
+        });
+      }
       await loadCvs();
       await refreshTrial();
     } catch (err) {
@@ -215,26 +246,66 @@ export default function DashboardPage() {
               ) : null}
             </div>
           </div>
-          <form onSubmit={onCreateJob} className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
+          <form onSubmit={onCreateJob} className="max-h-[min(70vh,520px)] space-y-3 overflow-y-auto rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
             <h3 className="text-sm font-semibold text-slate-900">New job</h3>
             <input
-              placeholder="Title"
+              placeholder="Job title"
               value={newTitle}
               onChange={(e) => setNewTitle(e.target.value)}
               required
-              className="mt-2 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
+              className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
             />
             <textarea
-              placeholder="Requirements / role brief"
+              placeholder="Role brief (main description)"
               value={newReq}
               onChange={(e) => setNewReq(e.target.value)}
               required
               rows={4}
-              className="mt-2 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
+              className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
             />
+            <div>
+              <label className="block text-xs font-medium text-slate-600">Location</label>
+              <input
+                placeholder="e.g. Berlin, hybrid, EU"
+                value={newLocation}
+                onChange={(e) => setNewLocation(e.target.value)}
+                className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
+              />
+              <label className="mt-2 flex cursor-pointer items-center gap-2 text-sm text-slate-700">
+                <input
+                  type="checkbox"
+                  checked={newRemoteOnly}
+                  onChange={(e) => setNewRemoteOnly(e.target.checked)}
+                  className="rounded border-slate-300"
+                />
+                Fully remote
+              </label>
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-slate-600">Years of experience</label>
+              <textarea
+                placeholder="e.g. 3–5 years in B2B sales"
+                value={newYearsExp}
+                onChange={(e) => setNewYearsExp(e.target.value)}
+                rows={2}
+                className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
+              />
+            </div>
+            <LanguageRowsEditor label="Mandatory languages" rows={mandatoryLangs} onChange={setMandatoryLangs} />
+            <LanguageRowsEditor label="Languages that are a plus" rows={bonusLangs} onChange={setBonusLangs} />
+            <div>
+              <label className="block text-xs font-medium text-slate-600">Skills</label>
+              <textarea
+                placeholder="Key skills, tools, certifications…"
+                value={newSkills}
+                onChange={(e) => setNewSkills(e.target.value)}
+                rows={3}
+                className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
+              />
+            </div>
             <button
               type="submit"
-              className="mt-2 w-full rounded-lg bg-brand-600 py-2 text-sm font-semibold text-white hover:bg-brand-700"
+              className="w-full rounded-lg bg-brand-600 py-2 text-sm font-semibold text-white hover:bg-brand-700"
             >
               Add job
             </button>
@@ -253,15 +324,17 @@ export default function DashboardPage() {
                 </div>
                 <div className="flex flex-wrap items-center gap-2">
                   <label className="inline-flex cursor-pointer items-center rounded-lg bg-brand-600 px-4 py-2 text-sm font-semibold text-white hover:bg-brand-700">
-                    Upload CV
+                    Upload CVs
                     <input
                       type="file"
-                      accept=".pdf,.docx"
+                      accept=".pdf,.docx,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                      multiple
                       className="hidden"
                       onChange={(e) => {
-                        const f = e.target.files?.[0];
-                        if (f) onUpload(f);
+                        const list = e.target.files;
+                        const fs = list ? Array.from(list) : [];
                         e.target.value = "";
+                        if (fs.length) void onUpload(fs);
                       }}
                     />
                   </label>
@@ -275,7 +348,7 @@ export default function DashboardPage() {
                 </div>
               </div>
               {uploadPct != null ? (
-                <div className="text-sm text-slate-600">Uploading… {uploadPct}%</div>
+                <div className="text-sm text-slate-600">Uploading CVs… {uploadPct}%</div>
               ) : null}
               <CVTable cvs={cvs} />
             </>

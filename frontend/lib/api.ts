@@ -16,12 +16,31 @@ export type MeResponse = TrialInfo & {
   company_name: string;
 };
 
+export type JobLanguage = { code: string; level: string; name: string };
+
 export type Job = {
   id: string;
   company_id: string;
   title: string;
   requirements: string;
   created_at: string;
+  location?: string;
+  remote_only?: boolean;
+  years_experience?: string;
+  mandatory_languages?: JobLanguage[];
+  bonus_languages?: JobLanguage[];
+  skills?: string;
+};
+
+export type CreateJobBody = {
+  title: string;
+  requirements: string;
+  location?: string;
+  remote_only?: boolean;
+  years_experience?: string;
+  mandatory_languages?: JobLanguage[];
+  bonus_languages?: JobLanguage[];
+  skills?: string;
 };
 
 export type CVRow = {
@@ -114,11 +133,20 @@ export async function fetchJobs(): Promise<Job[]> {
   return request<Job[]>("/jobs");
 }
 
-export async function createJob(title: string, requirements: string) {
+export async function createJob(body: CreateJobBody) {
   return request<Job>("/jobs", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ title, requirements }),
+    body: JSON.stringify({
+      title: body.title,
+      requirements: body.requirements,
+      location: body.location ?? "",
+      remote_only: body.remote_only ?? false,
+      years_experience: body.years_experience ?? "",
+      mandatory_languages: body.mandatory_languages ?? [],
+      bonus_languages: body.bonus_languages ?? [],
+      skills: body.skills ?? "",
+    }),
   });
 }
 
@@ -133,37 +161,35 @@ export async function fetchCvs(jobId: string) {
   return request<{ note: string; cvs: CVRow[] }>(`/jobs/${jobId}/cvs`);
 }
 
-export async function uploadCv(jobId: string, file: File, onProgress?: (p: number) => void) {
+export async function uploadCv(
+  jobId: string,
+  file: File,
+  onProgress?: (p: number) => void
+): Promise<{ id: string; status: string; filename: string }> {
   if (!API) {
-    return Promise.reject(new Error(missingApiMsg));
+    throw new Error(missingApiMsg);
   }
   const t = getToken();
   const fd = new FormData();
   fd.append("file", file);
-  return new Promise<{ id: string; status: string; filename: string }>((resolve, reject) => {
-    const xhr = new XMLHttpRequest();
-    xhr.open("POST", `${API}/jobs/${jobId}/cvs`);
-    if (t) xhr.setRequestHeader("Authorization", `Bearer ${t}`);
-    xhr.upload.onprogress = (e) => {
-      if (e.lengthComputable && onProgress) onProgress(Math.round((e.loaded / e.total) * 100));
-    };
-    xhr.onload = () => {
-      if (xhr.status >= 200 && xhr.status < 300) {
-        resolve(JSON.parse(xhr.responseText));
-      } else {
-        let detail = xhr.statusText;
-        try {
-          const j = JSON.parse(xhr.responseText);
-          if (j?.detail) detail = typeof j.detail === "string" ? j.detail : JSON.stringify(j.detail);
-        } catch {
-          /* ignore */
-        }
-        reject(new Error(detail));
-      }
-    };
-    xhr.onerror = () => reject(new Error("Network error"));
-    xhr.send(fd);
+  onProgress?.(0);
+  const res = await fetch(`${API}/jobs/${jobId}/cvs`, {
+    method: "POST",
+    headers: t ? { Authorization: `Bearer ${t}` } : {},
+    body: fd,
   });
+  onProgress?.(100);
+  if (!res.ok) {
+    let detail = res.statusText;
+    try {
+      const j = await res.json();
+      if (j?.detail) detail = typeof j.detail === "string" ? j.detail : JSON.stringify(j.detail);
+    } catch {
+      /* ignore */
+    }
+    throw new Error(detail);
+  }
+  return (await res.json()) as { id: string; status: string; filename: string };
 }
 
 export async function purchaseCredits(plan: "starter" | "professional") {
