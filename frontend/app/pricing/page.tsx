@@ -9,7 +9,11 @@ export default function PricingPage() {
   const [loading, setLoading] = useState<string | null>(null);
 
   useEffect(() => {
-    fetchPublicPricing().then(setData).catch(() => setError("Could not load pricing"));
+    fetchPublicPricing()
+      .then(setData)
+      .catch((e) =>
+        setError(e instanceof Error ? e.message : "Could not load pricing")
+      );
   }, []);
 
   async function buy(plan: "starter" | "professional") {

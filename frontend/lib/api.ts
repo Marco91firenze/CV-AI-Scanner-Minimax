@@ -170,6 +170,11 @@ export async function deleteAccount() {
 }
 
 export async function fetchPublicPricing() {
+  if (!API) {
+    throw new Error(
+      "Backend URL is not configured (set NEXT_PUBLIC_API_URL on Vercel for Production, then redeploy)."
+    );
+  }
   return request<{
     free_cvs: number;
     description: string;
