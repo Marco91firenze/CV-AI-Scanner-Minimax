@@ -64,7 +64,8 @@ class Settings(BaseSettings):
     openai_model: str = Field("gpt-4o-mini", alias="OPENAI_MODEL")
 
     stripe_secret_key: str = Field(..., alias="STRIPE_SECRET_KEY")
-    stripe_webhook_secret: str = Field(..., alias="STRIPE_WEBHOOK_SECRET")
+    # Empty until Stripe webhook is created; /health can boot without it.
+    stripe_webhook_secret: str = Field("", alias="STRIPE_WEBHOOK_SECRET")
     stripe_price_starter: str = Field(..., alias="STRIPE_PRICE_STARTER")
     stripe_price_professional: str = Field(..., alias="STRIPE_PRICE_PROFESSIONAL")
     starter_credits: int = Field(100, alias="STARTER_CREDITS")
@@ -400,6 +401,11 @@ def credits_purchase(
 
 @app.post("/api/stripe/webhook")
 async def stripe_webhook(request: Request):
+    if not settings.stripe_webhook_secret.strip():
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Stripe webhook signing secret is not set. Add STRIPE_WEBHOOK_SECRET in Railway, then redeploy.",
+        )
     payload = await request.body()
     sig = request.headers.get("stripe-signature")
     if not sig:
