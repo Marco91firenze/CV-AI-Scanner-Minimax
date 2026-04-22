@@ -5,8 +5,8 @@ GDPR-oriented: tenant isolation via MongoDB queries (company_id), ephemeral CV b
 
 from __future__ import annotations
 
+import threading
 import uuid
-from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any
 
@@ -79,31 +79,53 @@ def get_settings() -> Settings:
 settings = get_settings()
 stripe.api_key = settings.stripe_secret_key
 
-_mongo_client: MongoClient
-_db: Database
-_mongo_client, _db = connect(settings.mongodb_uri, settings.mongodb_database)
-_companies = col_companies(_db)
-_jobs = col_jobs(_db)
-_cvs = col_cvs(_db)
-_transactions = col_transactions(_db)
-
-_storage = ObjectStorage(
-    bucket=settings.s3_bucket,
-    access_key_id=settings.s3_access_key_id,
-    secret_access_key=settings.s3_secret_access_key,
-    endpoint_url=settings.s3_endpoint_url,
-    region_name=settings.s3_region,
-    encryption_key_b64=settings.cv_encryption_key,
-)
-_storage.ensure_bucket_exists()
+_init_lock = threading.Lock()
+_backend_ready = False
+_mongo_client: MongoClient | None = None
+_db: Database | None = None
+_companies: Any = None
+_jobs: Any = None
+_cvs: Any = None
+_transactions: Any = None
+_storage: ObjectStorage | None = None
 
 
-@asynccontextmanager
-async def lifespan(_: FastAPI):
-    yield
+def _ensure_backend() -> None:
+    """Connect to MongoDB and S3 on first real request so /health can pass Railway before Atlas is reachable."""
+    global _backend_ready, _mongo_client, _db, _companies, _jobs, _cvs, _transactions, _storage
+    if _backend_ready:
+        return
+    with _init_lock:
+        if _backend_ready:
+            return
+        _mongo_client, _db = connect(settings.mongodb_uri, settings.mongodb_database)
+        _companies = col_companies(_db)
+        _jobs = col_jobs(_db)
+        _cvs = col_cvs(_db)
+        _transactions = col_transactions(_db)
+        _storage = ObjectStorage(
+            bucket=settings.s3_bucket,
+            access_key_id=settings.s3_access_key_id,
+            secret_access_key=settings.s3_secret_access_key,
+            endpoint_url=settings.s3_endpoint_url,
+            region_name=settings.s3_region,
+            encryption_key_b64=settings.cv_encryption_key,
+        )
+        _storage.ensure_bucket_exists()
+        _backend_ready = True
 
 
-app = FastAPI(title="AI CV Scanner API", lifespan=lifespan)
+app = FastAPI(title="AI CV Scanner API")
+
+
+@app.middleware("http")
+async def lazy_init_backend(request: Request, call_next):
+    path = request.url.path.rstrip("/") or "/"
+    if path != "/health":
+        _ensure_backend()
+    return await call_next(request)
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[o.strip() for o in settings.cors_origins.split(",") if o.strip()],
