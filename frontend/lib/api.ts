@@ -45,11 +45,17 @@ export function setToken(token: string | null) {
   else localStorage.removeItem("ai_cv_token");
 }
 
+const missingApiMsg =
+  "Backend URL is not configured. Set NEXT_PUBLIC_API_URL on Vercel (Production) and redeploy.";
+
 async function request<T>(
   path: string,
   init: RequestInit = {},
   auth = true
 ): Promise<T> {
+  if (!API) {
+    throw new Error(missingApiMsg);
+  }
   const headers: HeadersInit = {
     ...(init.headers || {}),
   };
@@ -128,6 +134,9 @@ export async function fetchCvs(jobId: string) {
 }
 
 export async function uploadCv(jobId: string, file: File, onProgress?: (p: number) => void) {
+  if (!API) {
+    return Promise.reject(new Error(missingApiMsg));
+  }
   const t = getToken();
   const fd = new FormData();
   fd.append("file", file);
@@ -170,11 +179,6 @@ export async function deleteAccount() {
 }
 
 export async function fetchPublicPricing() {
-  if (!API) {
-    throw new Error(
-      "Backend URL is not configured (set NEXT_PUBLIC_API_URL on Vercel for Production, then redeploy)."
-    );
-  }
   return request<{
     free_cvs: number;
     description: string;

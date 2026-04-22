@@ -127,9 +127,23 @@ async def lazy_init_backend(request: Request, call_next):
     return await call_next(request)
 
 
+def _allowed_cors_origins() -> list[str]:
+    """Merge CORS_ORIGINS with PUBLIC_APP_URL so production works if only the latter is set."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for o in (x.strip() for x in settings.cors_origins.split(",") if x.strip()):
+        if o not in seen:
+            seen.add(o)
+            out.append(o)
+    pub = settings.public_app_url.rstrip("/")
+    if pub and pub not in seen:
+        out.append(pub)
+    return out
+
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[o.strip() for o in settings.cors_origins.split(",") if o.strip()],
+    allow_origins=_allowed_cors_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
