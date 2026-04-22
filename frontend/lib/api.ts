@@ -185,14 +185,18 @@ export async function uploadCv(
   file: File,
   onProgress?: (p: number) => void
 ): Promise<{ id: string; status: string; filename: string }> {
+  if (!API) {
+    throw new Error(missingApiMsg);
+  }
   const t = getToken();
   if (!t) {
     throw new Error("Not signed in");
   }
   const fd = new FormData();
-  fd.append("file", file);
+  fd.append("file", file, file.name);
   onProgress?.(0);
-  const res = await fetch(`/api/jobs/${encodeURIComponent(jobId)}/cvs`, {
+  // Upload directly to Railway — Vercel serverless proxies cap request bodies (~4.5MB) and large CVs would hang/fail silently.
+  const res = await fetch(`${API}/jobs/${encodeURIComponent(jobId)}/cvs`, {
     method: "POST",
     headers: { Authorization: `Bearer ${t}` },
     body: fd,

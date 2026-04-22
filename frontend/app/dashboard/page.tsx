@@ -151,14 +151,23 @@ export default function DashboardPage() {
   }
 
   async function onUpload(files: File[]) {
-    if (!selectedJob || files.length === 0) return;
+    if (files.length === 0) return;
+    const jobId = selectedJob;
+    if (!jobId) {
+      setError("Select a job in the list before uploading CVs.");
+      return;
+    }
+    if (!jobs.some((j) => j.id === jobId)) {
+      setError("The selected job is no longer available. Refresh or pick another job.");
+      return;
+    }
     setError(null);
     setUploadPct(0);
     const n = files.length;
     try {
       for (let i = 0; i < n; i++) {
         const file = files[i]!;
-        await uploadCv(selectedJob, file, (p) => {
+        await uploadCv(jobId, file, (p) => {
           const base = (i / n) * 100;
           const slice = (100 / n) * (p / 100);
           setUploadPct(Math.round(base + slice));
@@ -167,7 +176,8 @@ export default function DashboardPage() {
       await loadCvs();
       await refreshTrial();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Upload failed");
+      const msg = err instanceof Error ? err.message : "Upload failed";
+      setError(msg === "Failed to fetch" ? "Upload failed to reach the API (network or CORS). Try again or use a smaller file." : msg);
     } finally {
       setUploadPct(null);
     }
