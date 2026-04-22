@@ -1,3 +1,4 @@
+# Monorepo: build FastAPI app from backend/ (Railway builds from repo root).
 FROM python:3.12-slim-bookworm
 
 WORKDIR /app
@@ -5,10 +6,10 @@ WORKDIR /app
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-COPY requirements.txt .
+COPY backend/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY . .
+COPY backend/ .
 
 ENV PORT=8080
 EXPOSE 8080
