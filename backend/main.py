@@ -10,6 +10,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any
 
+import bcrypt
 import stripe
 from fastapi import (
     BackgroundTasks,
@@ -22,9 +23,9 @@ from fastapi import (
     status,
 )
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from jose import JWTError, jwt
-from passlib.context import CryptContext
 from pydantic import BaseModel, EmailStr, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pymongo import MongoClient
@@ -38,7 +39,6 @@ from services.storage import ObjectStorage, delete_cv
 
 FREE_CV_LIMIT = 10
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
 
 
@@ -136,7 +136,9 @@ app = FastAPI(title="AI CV Scanner API")
 async def lazy_init_backend(request: Request, call_next):
     path = request.url.path.rstrip("/") or "/"
     # OPTIONS preflight must not block on DB init (and should match CORS before routes).
-    if path != "/health" and request.method != "OPTIONS":
+    # /health is liveness only; /health/ready checks Mongo and returns JSON errors (must not init here).
+    skip_mongo = path in ("/health", "/health/ready") or request.method == "OPTIONS"
+    if not skip_mongo:
         _ensure_mongo()
     return await call_next(request)
 
@@ -173,11 +175,20 @@ def utcnow() -> str:
 
 
 def verify_password(plain: str, hashed: str) -> bool:
-    return pwd_context.verify(plain, hashed)
+    try:
+        return bcrypt.checkpw(
+            plain.encode("utf-8"),
+            hashed.encode("utf-8"),
+        )
+    except (ValueError, TypeError):
+        return False
 
 
 def hash_password(password: str) -> str:
-    return pwd_context.hash(password)
+    return bcrypt.hashpw(
+        password.encode("utf-8"),
+        bcrypt.gensalt(rounds=12),
+    ).decode("ascii")
 
 
 def create_access_token(sub: str, expires_delta: timedelta | None = None) -> str:
@@ -672,6 +683,26 @@ def delete_account(company: Annotated[dict[str, Any], Depends(get_current_compan
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/health/ready")
+def health_ready():
+    """Returns MongoDB connectivity; use this URL in the browser when /auth/register returns 500."""
+    try:
+        _ensure_mongo()
+        if _mongo_client is None:
+            raise RuntimeError("Mongo client not initialized")
+        _mongo_client.admin.command("ping")
+        return {"mongodb": "ok", "database": settings.mongodb_database}
+    except Exception as e:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "mongodb": "error",
+                "error": str(e),
+                "error_type": type(e).__name__,
+            },
+        )
 
 
 class LoginJson(BaseModel):
