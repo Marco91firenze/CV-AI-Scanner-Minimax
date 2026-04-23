@@ -2,6 +2,8 @@ import { NextRequest, NextResponse } from "next/server";
 
 /** Large PDFs + slow networks */
 export const maxDuration = 120;
+/** Multipart + forwarding FormData to Railway is unreliable on Edge */
+export const runtime = "nodejs";
 
 function backendBase(): string {
   const raw = process.env.NEXT_PUBLIC_API_URL || process.env.BACKEND_URL;
@@ -58,6 +60,13 @@ export async function POST(req: NextRequest, context: { params: { jobId: string 
   }
 
   const text = await upstream.text();
+  if (!upstream.ok) {
+    console.error(
+      "[cv-upload-proxy] upstream",
+      upstream.status,
+      text.slice(0, 500)
+    );
+  }
   const ct = upstream.headers.get("content-type") || "application/json";
   return new NextResponse(text, { status: upstream.status, headers: { "content-type": ct } });
 }

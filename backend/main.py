@@ -14,6 +14,7 @@ from typing import Annotated, Any
 
 import bcrypt
 import stripe
+from botocore.exceptions import ClientError
 from fastapi import (
     BackgroundTasks,
     Depends,
@@ -880,11 +881,29 @@ async def upload_cv(
     blob_key = f"{uuid.uuid4()}_{safe_name}"
 
     _ensure_storage()
+    assert _storage is not None
     try:
         path = _storage.upload_cv(cid, job_id, blob_key, raw)
-    except Exception:
+    except ClientError as e:
         _reverse_cv_consumption(load_company(cid), used_free_slot)
-        raise
+        err = e.response.get("Error", {}) if e.response else {}
+        code = err.get("Code", "S3Error")
+        msg = err.get("Message", str(e))
+        logger.warning("S3 PutObject failed: %s %s", code, msg)
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            f"Object storage error ({code}). Check S3 bucket, IAM (PutObject), and S3_REGION matches the bucket region.",
+        ) from e
+    except ValueError as e:
+        _reverse_cv_consumption(load_company(cid), used_free_slot)
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, str(e)) from e
+    except Exception as e:
+        _reverse_cv_consumption(load_company(cid), used_free_slot)
+        logger.exception("upload_cv failed after credits reserved")
+        raise HTTPException(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            f"Could not store CV ({type(e).__name__}). Check server logs.",
+        ) from e
 
     cv_id = str(uuid.uuid4())
     cv_doc = {
