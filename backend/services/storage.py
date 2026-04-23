@@ -13,6 +13,23 @@ from lib.encryption import decrypt_bytes, encrypt_bytes
 
 logger = logging.getLogger(__name__)
 
+# GetBucketLocation sometimes returns legacy codes; SigV4 must use the real region name.
+_LEGACY_GET_BUCKET_LOCATION: dict[str, str] = {
+    "EU": "eu-west-1",
+    "US": "us-east-1",
+}
+
+
+def _normalize_s3_location_constraint(raw: str | None) -> str:
+    if raw is None or raw == "":
+        return "us-east-1"
+    key = str(raw)
+    return _LEGACY_GET_BUCKET_LOCATION.get(key, key)
+
+
+def _clean_aws_credential(s: str) -> str:
+    return s.strip().strip("\ufeff")
+
 
 def _aws_bucket_region_from_api(bucket: str, access_key_id: str, secret_access_key: str) -> str | None:
     """Ask AWS which region the bucket lives in (fixes SignatureDoesNotMatch when S3_REGION is wrong).
@@ -29,12 +46,15 @@ def _aws_bucket_region_from_api(bucket: str, access_key_id: str, secret_access_k
         )
         resp = loc_cli.get_bucket_location(Bucket=bucket)
     except ClientError as e:
-        logger.warning("Could not resolve bucket region via GetBucketLocation: %s", e)
+        err = e.response.get("Error", {}) if e.response else {}
+        logger.warning(
+            "Could not resolve bucket region via GetBucketLocation (%s): %s",
+            err.get("Code", "?"),
+            e,
+        )
         return None
-    loc = resp.get("LocationConstraint")
-    if loc is None or loc == "":
-        return "us-east-1"
-    return str(loc)
+    raw_loc = resp.get("LocationConstraint")
+    return _normalize_s3_location_constraint(None if raw_loc is None else str(raw_loc))
 
 
 class ObjectStorage:
@@ -49,8 +69,8 @@ class ObjectStorage:
         region_name: str | None,
         encryption_key_b64: str,
     ) -> None:
-        access_key_id = access_key_id.strip()
-        secret_access_key = secret_access_key.strip()
+        access_key_id = _clean_aws_credential(access_key_id)
+        secret_access_key = _clean_aws_credential(secret_access_key)
         bucket = bucket.strip()
 
         eff_region = region_name or ("auto" if endpoint_url else "eu-central-1")
@@ -58,11 +78,11 @@ class ObjectStorage:
         kw: dict = {
             "aws_access_key_id": access_key_id,
             "aws_secret_access_key": secret_access_key,
-            "config": Config(signature_version="s3v4", s3={"addressing_style": "virtual"}),
         }
         if endpoint_url:
             kw["endpoint_url"] = endpoint_url.rstrip("/")
             kw["region_name"] = eff_region
+            kw["config"] = Config(signature_version="s3v4", s3={"addressing_style": "virtual"})
         else:
             # AWS: do not set endpoint_url — boto3 picks the correct host for SigV4.
             resolved = _aws_bucket_region_from_api(bucket, access_key_id, secret_access_key)
@@ -77,6 +97,8 @@ class ObjectStorage:
                 kw["region_name"] = resolved
             else:
                 kw["region_name"] = aws_region
+            # Let botocore pick SigV4 + endpoint style; "virtual" alone has caused SignatureDoesNotMatch.
+            kw["config"] = Config(s3={"addressing_style": "auto"})
         self._client = boto3.client("s3", **kw)
         self._bucket = bucket
         self._enc_key = encryption_key_b64
