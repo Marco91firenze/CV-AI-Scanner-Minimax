@@ -24,20 +24,19 @@ class ObjectStorage:
         encryption_key_b64: str,
     ) -> None:
         eff_region = region_name or ("auto" if endpoint_url else "eu-central-1")
+        aws_region = eff_region if eff_region not in ("", "auto") else "eu-central-1"
         kw: dict = {
             "aws_access_key_id": access_key_id,
             "aws_secret_access_key": secret_access_key,
-            "region_name": eff_region,
             "config": Config(signature_version="s3v4", s3={"addressing_style": "virtual"}),
         }
         if endpoint_url:
             kw["endpoint_url"] = endpoint_url.rstrip("/")
+            kw["region_name"] = eff_region
         else:
-            # Regional endpoint avoids odd DNS/CORS behaviour with bucket.s3.amazonaws.com on some buckets.
-            sign_region = eff_region if eff_region not in ("", "auto") else "eu-central-1"
-            kw["endpoint_url"] = f"https://s3.{sign_region}.amazonaws.com"
-            if eff_region == "auto":
-                kw["region_name"] = sign_region
+            # AWS: do not set endpoint_url — boto3 picks the correct host for SigV4. Forcing
+            # https://s3.{region}.amazonaws.com caused SignatureDoesNotMatch on PutObject for some setups.
+            kw["region_name"] = aws_region
         self._client = boto3.client("s3", **kw)
         self._bucket = bucket
         self._enc_key = encryption_key_b64
