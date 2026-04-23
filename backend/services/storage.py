@@ -31,19 +31,14 @@ def _clean_aws_credential(s: str) -> str:
     return s.strip().strip("\ufeff")
 
 
-def _aws_bucket_region_from_api(bucket: str, access_key_id: str, secret_access_key: str) -> str | None:
+def _aws_bucket_region_from_api(bucket: str, session: boto3.Session) -> str | None:
     """Ask AWS which region the bucket lives in (fixes SignatureDoesNotMatch when S3_REGION is wrong).
 
     Uses GetBucketLocation (needs s3:GetBucketLocation on arn:aws:s3:::bucket-name). If that fails,
     returns None and the caller falls back to configured S3_REGION.
     """
     try:
-        loc_cli = boto3.client(
-            "s3",
-            region_name="us-east-1",
-            aws_access_key_id=access_key_id,
-            aws_secret_access_key=secret_access_key,
-        )
+        loc_cli = session.client("s3", region_name="us-east-1")
         resp = loc_cli.get_bucket_location(Bucket=bucket)
     except ClientError as e:
         err = e.response.get("Error", {}) if e.response else {}
@@ -68,6 +63,7 @@ class ObjectStorage:
         endpoint_url: str | None,
         region_name: str | None,
         encryption_key_b64: str,
+        skip_location_probe: bool = False,
     ) -> None:
         access_key_id = _clean_aws_credential(access_key_id)
         secret_access_key = _clean_aws_credential(secret_access_key)
@@ -75,17 +71,26 @@ class ObjectStorage:
 
         eff_region = region_name or ("auto" if endpoint_url else "eu-central-1")
         aws_region = eff_region if eff_region not in ("", "auto") else "eu-central-1"
-        kw: dict = {
-            "aws_access_key_id": access_key_id,
-            "aws_secret_access_key": secret_access_key,
-        }
+        # Explicit session avoids accidentally mixing env/instance credentials with S3_* vars.
+        session = boto3.Session(
+            aws_access_key_id=access_key_id,
+            aws_secret_access_key=secret_access_key,
+        )
+        kw: dict[str, Any] = {}
         if endpoint_url:
             kw["endpoint_url"] = endpoint_url.rstrip("/")
             kw["region_name"] = eff_region
             kw["config"] = Config(signature_version="s3v4", s3={"addressing_style": "virtual"})
         else:
             # AWS: do not set endpoint_url — boto3 picks the correct host for SigV4.
-            resolved = _aws_bucket_region_from_api(bucket, access_key_id, secret_access_key)
+            resolved: str | None = None
+            if skip_location_probe:
+                logger.info(
+                    "S3 skip_location_probe: using configured region %s (no GetBucketLocation)",
+                    aws_region,
+                )
+            else:
+                resolved = _aws_bucket_region_from_api(bucket, session)
             if resolved:
                 if resolved != aws_region:
                     logger.warning(
@@ -100,7 +105,7 @@ class ObjectStorage:
             # Let botocore pick SigV4 + endpoint style; "virtual" alone has caused SignatureDoesNotMatch.
             kw["config"] = Config(s3={"addressing_style": "auto"})
         signing_region = kw.get("region_name")
-        self._client = boto3.client("s3", **kw)
+        self._client = session.client("s3", **kw)
         self._bucket = bucket
         self._enc_key = encryption_key_b64
         logger.info(

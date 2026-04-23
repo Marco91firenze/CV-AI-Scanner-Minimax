@@ -6,6 +6,7 @@ GDPR-oriented: tenant isolation via MongoDB queries (company_id), ephemeral CV b
 from __future__ import annotations
 
 import logging
+import os
 import re
 import threading
 import uuid
@@ -66,6 +67,8 @@ class Settings(BaseSettings):
     s3_secret_access_key: str = Field(..., alias="S3_SECRET_ACCESS_KEY")
     s3_endpoint_url: str | None = Field(None, alias="S3_ENDPOINT_URL")
     s3_region: str | None = Field(None, alias="S3_REGION")
+    # When true, skip GetBucketLocation and sign with S3_REGION only (use if probe fails or is wrong).
+    s3_skip_location_probe: bool = Field(False, alias="S3_SKIP_LOCATION_PROBE")
     cv_encryption_key: str = Field(..., alias="CV_ENCRYPTION_KEY")
 
     openai_api_key: str = Field(..., alias="OPENAI_API_KEY")
@@ -165,6 +168,18 @@ def _ensure_storage() -> None:
     with _init_lock:
         if _storage is not None:
             return
+        env_ak = (os.environ.get("AWS_ACCESS_KEY_ID") or "").strip()
+        env_sk = (os.environ.get("AWS_SECRET_ACCESS_KEY") or "").strip()
+        if env_ak and env_ak != settings.s3_access_key_id:
+            logger.warning(
+                "AWS_ACCESS_KEY_ID is set in the environment and differs from S3_ACCESS_KEY_ID — "
+                "remove duplicate AWS_* vars on Railway so only S3_* keys are used (avoids confusion)."
+            )
+        if env_sk and env_sk != settings.s3_secret_access_key:
+            logger.warning(
+                "AWS_SECRET_ACCESS_KEY is set in the environment and differs from S3_SECRET_ACCESS_KEY — "
+                "remove duplicate AWS_* vars on Railway."
+            )
         _storage = ObjectStorage(
             bucket=settings.s3_bucket,
             access_key_id=settings.s3_access_key_id,
@@ -172,6 +187,7 @@ def _ensure_storage() -> None:
             endpoint_url=settings.s3_endpoint_url,
             region_name=settings.s3_region,
             encryption_key_b64=settings.cv_encryption_key,
+            skip_location_probe=settings.s3_skip_location_probe,
         )
         _storage.ensure_bucket_exists()
 
@@ -933,9 +949,10 @@ async def upload_cv(
             detail = (
                 "S3 rejected the request signature. Create ONE new IAM access key and set both "
                 "S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY from that key (no mixing two keys). "
-                "In S3 → bucket → Properties confirm the real Region. Add IAM permission "
-                "s3:GetBucketLocation on arn:aws:s3:::YOUR_BUCKET so the app can align signing. "
-                "Strip any spaces in Railway variable values."
+                "Remove any Railway vars AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY if they differ from S3_*. "
+                "For real AWS S3, leave S3_ENDPOINT_URL empty. In bucket Properties confirm Region; set "
+                "S3_REGION to that value, or set S3_SKIP_LOCATION_PROBE=true if GetBucketLocation is blocked. "
+                "Strip spaces/newlines in Railway values."
             )
         else:
             detail = (
