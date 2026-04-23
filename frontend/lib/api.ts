@@ -227,7 +227,10 @@ function putFileToPresignedUrl(
   });
 }
 
-/** Server accepts multipart and writes to S3 — avoids browser→S3 CORS on PUT. */
+/**
+ * Multipart upload via same-origin Next.js proxy → Railway (see app/api/jobs/[jobId]/cvs/route.ts).
+ * Avoids browser→Railway CORS. Note: Vercel request bodies are capped (~4.5MB); larger CVs need S3 PUT working.
+ */
 function uploadCvMultipartDirect(
   jobId: string,
   file: File,
@@ -242,7 +245,7 @@ function uploadCvMultipartDirect(
   }
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
-    xhr.open("POST", `${API}/jobs/${encodeURIComponent(jobId)}/cvs`);
+    xhr.open("POST", `/api/jobs/${encodeURIComponent(jobId)}/cvs`);
     xhr.setRequestHeader("Authorization", `Bearer ${t}`);
     xhr.timeout = 600_000;
     xhr.upload.onprogress = (ev) => {
@@ -251,6 +254,14 @@ function uploadCvMultipartDirect(
       }
     };
     xhr.onload = () => {
+      if (xhr.status === 0) {
+        reject(
+          new Error(
+            "Upload failed (no response). If the file is large, Vercel may reject the body (~4.5MB limit); fix S3 browser upload or deploy API without that cap."
+          )
+        );
+        return;
+      }
       if (xhr.status >= 200 && xhr.status < 300) {
         try {
           resolve(JSON.parse(xhr.responseText) as { id: string; status: string; filename: string });
@@ -273,7 +284,7 @@ function uploadCvMultipartDirect(
     xhr.onerror = () =>
       reject(
         new Error(
-          "Multipart upload could not reach the API. Check NEXT_PUBLIC_API_URL and Railway CORS for your site origin."
+          "Multipart upload failed (network). Same-origin /api proxy should not hit CORS—check connection or try again."
         )
       );
     const fd = new FormData();
