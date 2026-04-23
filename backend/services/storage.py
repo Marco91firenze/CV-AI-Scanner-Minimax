@@ -72,12 +72,16 @@ class ObjectStorage:
             pass
 
     def presigned_put_url(self, key: str, content_type: str, expires: int = 900) -> str:
-        # Do not put ContentType in Params: it becomes a signed header (content-type;host) and
-        # browsers' CORS preflight OPTIONS often get 403 on S3. The client still sends Content-Type on PUT.
-        _ = content_type
+        # Include ContentType in the signature. If the browser sends a different Content-Type on PUT
+        # (e.g. application/octet-stream for ArrayBuffer), S3 returns 403; error bodies often lack
+        # CORS headers, so XHR surfaces it as a generic "network/CORS" failure.
         return self._client.generate_presigned_url(
             "put_object",
-            Params={"Bucket": self._bucket, "Key": key},
+            Params={
+                "Bucket": self._bucket,
+                "Key": key,
+                "ContentType": content_type,
+            },
             ExpiresIn=expires,
             HttpMethod="PUT",
         )
