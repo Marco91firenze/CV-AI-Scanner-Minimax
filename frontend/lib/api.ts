@@ -227,6 +227,61 @@ function putFileToPresignedUrl(
   });
 }
 
+/** Server accepts multipart and writes to S3 — avoids browser→S3 CORS on PUT. */
+function uploadCvMultipartDirect(
+  jobId: string,
+  file: File,
+  onProgress?: (p: number) => void
+): Promise<{ id: string; status: string; filename: string }> {
+  if (!API) {
+    throw new Error(missingApiMsg);
+  }
+  const t = getToken();
+  if (!t) {
+    throw new Error("Not signed in");
+  }
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", `${API}/jobs/${encodeURIComponent(jobId)}/cvs`);
+    xhr.setRequestHeader("Authorization", `Bearer ${t}`);
+    xhr.timeout = 600_000;
+    xhr.upload.onprogress = (ev) => {
+      if (ev.lengthComputable && onProgress && ev.total > 0) {
+        onProgress(Math.round((ev.loaded / ev.total) * 100));
+      }
+    };
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        try {
+          resolve(JSON.parse(xhr.responseText) as { id: string; status: string; filename: string });
+        } catch {
+          reject(new Error("Invalid response from server"));
+        }
+        return;
+      }
+      let detail = xhr.statusText;
+      try {
+        const j = JSON.parse(xhr.responseText) as { detail?: unknown };
+        if (j?.detail) detail = typeof j.detail === "string" ? j.detail : JSON.stringify(j.detail);
+      } catch {
+        const raw = xhr.responseText?.trim();
+        if (raw) detail = raw.slice(0, 500);
+      }
+      reject(new Error(detail));
+    };
+    xhr.ontimeout = () => reject(new Error("Upload timed out."));
+    xhr.onerror = () =>
+      reject(
+        new Error(
+          "Multipart upload could not reach the API. Check NEXT_PUBLIC_API_URL and Railway CORS for your site origin."
+        )
+      );
+    const fd = new FormData();
+    fd.append("file", file, file.name);
+    xhr.send(fd);
+  });
+}
+
 export async function uploadCv(
   jobId: string,
   file: File,
@@ -260,9 +315,14 @@ export async function uploadCv(
 
   onProgress?.(2);
 
-  await putFileToPresignedUrl(presign.put_url, file, presign.headers, (ratio) => {
-    onProgress?.(2 + Math.round(ratio * 88));
-  });
+  try {
+    await putFileToPresignedUrl(presign.put_url, file, presign.headers, (ratio) => {
+      onProgress?.(2 + Math.round(ratio * 88));
+    });
+  } catch {
+    onProgress?.(0);
+    return uploadCvMultipartDirect(jobId, file, onProgress);
+  }
 
   onProgress?.(92);
 
