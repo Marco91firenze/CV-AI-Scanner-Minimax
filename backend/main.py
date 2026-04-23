@@ -29,7 +29,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from jose import JWTError, jwt
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pymongo import MongoClient
 from pymongo.database import Database
@@ -81,6 +81,45 @@ class Settings(BaseSettings):
     public_app_url: str = Field("http://localhost:3000", alias="PUBLIC_APP_URL")
     # Browser uploads go directly to S3/R2 (presigned PUT); this caps size server-side at finalize.
     max_cv_upload_bytes: int = Field(55 * 1024 * 1024, alias="MAX_CV_UPLOAD_BYTES")
+
+    @field_validator("s3_endpoint_url", mode="before")
+    @classmethod
+    def s3_endpoint_empty_none(cls, v: object) -> str | None:
+        if v is None:
+            return None
+        if isinstance(v, str) and not v.strip():
+            return None
+        return v.strip() if isinstance(v, str) else None
+
+    @field_validator("s3_region", mode="before")
+    @classmethod
+    def s3_region_empty_none(cls, v: object) -> str | None:
+        if v is None:
+            return None
+        if isinstance(v, str) and not v.strip():
+            return None
+        return v.strip() if isinstance(v, str) else None
+
+    @field_validator("s3_access_key_id", "s3_bucket", mode="before")
+    @classmethod
+    def strip_s3_strings(cls, v: object) -> object:
+        if isinstance(v, str):
+            return v.strip().strip("\ufeff")
+        return v
+
+    @field_validator("s3_secret_access_key", mode="before")
+    @classmethod
+    def strip_s3_secret(cls, v: object) -> object:
+        if isinstance(v, str):
+            # Railway paste often adds newlines or BOM — breaks SigV4.
+            return (
+                v.strip()
+                .strip("\ufeff")
+                .replace("\r\n", "")
+                .replace("\n", "")
+                .replace("\r", "")
+            )
+        return v
 
 
 def get_settings() -> Settings:

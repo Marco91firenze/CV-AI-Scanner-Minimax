@@ -99,9 +99,18 @@ class ObjectStorage:
                 kw["region_name"] = aws_region
             # Let botocore pick SigV4 + endpoint style; "virtual" alone has caused SignatureDoesNotMatch.
             kw["config"] = Config(s3={"addressing_style": "auto"})
+        signing_region = kw.get("region_name")
         self._client = boto3.client("s3", **kw)
         self._bucket = bucket
         self._enc_key = encryption_key_b64
+        logger.info(
+            "ObjectStorage init bucket=%s signing_region=%s key_prefix=%s secret_len=%s custom_endpoint=%s",
+            bucket,
+            signing_region,
+            (access_key_id[:4] + "...") if len(access_key_id) >= 4 else access_key_id,
+            len(secret_access_key),
+            bool(endpoint_url),
+        )
 
     def ensure_bucket_exists(self) -> None:
         try:
