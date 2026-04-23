@@ -890,10 +890,19 @@ async def upload_cv(
         code = err.get("Code", "S3Error")
         msg = err.get("Message", str(e))
         logger.warning("S3 PutObject failed: %s %s", code, msg)
-        raise HTTPException(
-            status.HTTP_503_SERVICE_UNAVAILABLE,
-            f"Object storage error ({code}). Check S3 bucket, IAM (PutObject), and S3_REGION matches the bucket region.",
-        ) from e
+        if code == "SignatureDoesNotMatch":
+            detail = (
+                "S3 rejected the request signature. Create ONE new IAM access key and set both "
+                "S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY from that key (no mixing two keys). "
+                "In S3 → bucket → Properties confirm the real Region. Add IAM permission "
+                "s3:GetBucketLocation on arn:aws:s3:::YOUR_BUCKET so the app can align signing. "
+                "Strip any spaces in Railway variable values."
+            )
+        else:
+            detail = (
+                f"Object storage error ({code}). Check S3 bucket, IAM (PutObject), and region."
+            )
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, detail) from e
     except ValueError as e:
         _reverse_cv_consumption(load_company(cid), used_free_slot)
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, str(e)) from e

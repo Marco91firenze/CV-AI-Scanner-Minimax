@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import boto3
@@ -9,6 +10,31 @@ from botocore.config import Config
 from botocore.exceptions import ClientError
 
 from lib.encryption import decrypt_bytes, encrypt_bytes
+
+logger = logging.getLogger(__name__)
+
+
+def _aws_bucket_region_from_api(bucket: str, access_key_id: str, secret_access_key: str) -> str | None:
+    """Ask AWS which region the bucket lives in (fixes SignatureDoesNotMatch when S3_REGION is wrong).
+
+    Uses GetBucketLocation (needs s3:GetBucketLocation on arn:aws:s3:::bucket-name). If that fails,
+    returns None and the caller falls back to configured S3_REGION.
+    """
+    try:
+        loc_cli = boto3.client(
+            "s3",
+            region_name="us-east-1",
+            aws_access_key_id=access_key_id,
+            aws_secret_access_key=secret_access_key,
+        )
+        resp = loc_cli.get_bucket_location(Bucket=bucket)
+    except ClientError as e:
+        logger.warning("Could not resolve bucket region via GetBucketLocation: %s", e)
+        return None
+    loc = resp.get("LocationConstraint")
+    if loc is None or loc == "":
+        return "us-east-1"
+    return str(loc)
 
 
 class ObjectStorage:
@@ -23,6 +49,10 @@ class ObjectStorage:
         region_name: str | None,
         encryption_key_b64: str,
     ) -> None:
+        access_key_id = access_key_id.strip()
+        secret_access_key = secret_access_key.strip()
+        bucket = bucket.strip()
+
         eff_region = region_name or ("auto" if endpoint_url else "eu-central-1")
         aws_region = eff_region if eff_region not in ("", "auto") else "eu-central-1"
         kw: dict = {
@@ -34,9 +64,19 @@ class ObjectStorage:
             kw["endpoint_url"] = endpoint_url.rstrip("/")
             kw["region_name"] = eff_region
         else:
-            # AWS: do not set endpoint_url — boto3 picks the correct host for SigV4. Forcing
-            # https://s3.{region}.amazonaws.com caused SignatureDoesNotMatch on PutObject for some setups.
-            kw["region_name"] = aws_region
+            # AWS: do not set endpoint_url — boto3 picks the correct host for SigV4.
+            resolved = _aws_bucket_region_from_api(bucket, access_key_id, secret_access_key)
+            if resolved:
+                if resolved != aws_region:
+                    logger.warning(
+                        "S3 bucket %s is in %s; S3_REGION was %s — using detected region for signing",
+                        bucket,
+                        resolved,
+                        aws_region,
+                    )
+                kw["region_name"] = resolved
+            else:
+                kw["region_name"] = aws_region
         self._client = boto3.client("s3", **kw)
         self._bucket = bucket
         self._enc_key = encryption_key_b64
